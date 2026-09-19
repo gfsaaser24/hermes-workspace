@@ -29,6 +29,7 @@ import {
   getGatewayCapabilities,
   getMessages as getSessionMessagesFromAgent,
   listSessions,
+  lockSessionModel,
   streamChat,
 } from '../../server/claude-api'
 import { loadWorkspaceCatalog } from './workspace'
@@ -1006,6 +1007,10 @@ export const Route = createFileRoute('/api/send-stream')({
               })()
 
               try {
+                // hermes-jcmm: make the picked model stateful on the agent side.
+                if (typeof body.model === 'string' && body.model.trim() && !localBaseUrl) {
+                  await lockSessionModel(sessionKey, body.model)
+                }
                 await streamChat(
                 sessionKey,
                 {

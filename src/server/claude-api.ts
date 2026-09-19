@@ -371,6 +371,28 @@ type StreamChatOptions = {
  * Send a chat message and stream SSE events from Hermes Agent FastAPI.
  * Returns a promise that resolves when the stream ends.
  */
+/**
+ * hermes-jcmm: persist the picked model ON THE AGENT for this session
+ * (POST /api/sessions/{id}/model — Hermes' per-session model lock), so the
+ * choice is stateful across devices/reloads and wins over the global default.
+ * Best-effort: never throws.
+ */
+export async function lockSessionModel(sessionId: string, model: string): Promise<void> {
+  const id = sessionId.trim()
+  const m = model.trim()
+  if (!id || !m || id === 'new') return
+  try {
+    await fetch(`${CLAUDE_API}/api/sessions/${encodeURIComponent(id)}/model`, {
+      method: 'POST',
+      headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: m }),
+      signal: AbortSignal.timeout(5000),
+    })
+  } catch (err) {
+    console.warn(`[claude-api] session model lock failed for ${id}: ${err instanceof Error ? err.message : err}`)
+  }
+}
+
 export async function streamChat(
   sessionId: string,
   body: {
