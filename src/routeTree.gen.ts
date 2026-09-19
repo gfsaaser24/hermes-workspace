@@ -31,6 +31,7 @@ import { Route as EarlyAccessRouteImport } from './routes/early-access'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as ConductorRouteImport } from './routes/conductor'
 import { Route as AgoraRouteImport } from './routes/agora'
+import { Route as AgentFilesRouteImport } from './routes/agent-files'
 import { Route as SplatRouteImport } from './routes/$'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as SettingsIndexRouteImport } from './routes/settings/index'
@@ -113,6 +114,7 @@ import { Route as ApiChatEventsRouteImport } from './routes/api/chat-events'
 import { Route as ApiAuthCheckRouteImport } from './routes/api/auth-check'
 import { Route as ApiAuthRouteImport } from './routes/api/auth'
 import { Route as ApiArtifactsRouteImport } from './routes/api/artifacts'
+import { Route as ApiAgentFilesRouteImport } from './routes/api/agent-files'
 import { Route as ApiAgentBusRouteImport } from './routes/api/agent-bus'
 import { Route as ChatHarnessRuntimeIdRouteImport } from './routes/chat/harness/$runtimeId'
 import { Route as ChatExternalConversationIdRouteImport } from './routes/chat/external/$conversationId'
@@ -284,6 +286,11 @@ const ConductorRoute = ConductorRouteImport.update({
 const AgoraRoute = AgoraRouteImport.update({
   id: '/agora',
   path: '/agora',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AgentFilesRoute = AgentFilesRouteImport.update({
+  id: '/agent-files',
+  path: '/agent-files',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SplatRoute = SplatRouteImport.update({
@@ -698,6 +705,11 @@ const ApiArtifactsRoute = ApiArtifactsRouteImport.update({
   path: '/api/artifacts',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiAgentFilesRoute = ApiAgentFilesRouteImport.update({
+  id: '/api/agent-files',
+  path: '/api/agent-files',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiAgentBusRoute = ApiAgentBusRouteImport.update({
   id: '/api/agent-bus',
   path: '/api/agent-bus',
@@ -1022,6 +1034,7 @@ const ApiRunsSessionKeyRunIdAbandonRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/agent-files': typeof AgentFilesRoute
   '/agora': typeof AgoraRoute
   '/conductor': typeof ConductorRoute
   '/dashboard': typeof DashboardRoute
@@ -1045,6 +1058,7 @@ export interface FileRoutesByFullPath {
   '/vt-capital': typeof VtCapitalRoute
   '/world': typeof WorldRoute
   '/api/agent-bus': typeof ApiAgentBusRoute
+  '/api/agent-files': typeof ApiAgentFilesRoute
   '/api/artifacts': typeof ApiArtifactsRouteWithChildren
   '/api/auth': typeof ApiAuthRoute
   '/api/auth-check': typeof ApiAuthCheckRoute
@@ -1190,6 +1204,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/agent-files': typeof AgentFilesRoute
   '/agora': typeof AgoraRoute
   '/conductor': typeof ConductorRoute
   '/dashboard': typeof DashboardRoute
@@ -1212,6 +1227,7 @@ export interface FileRoutesByTo {
   '/vt-capital': typeof VtCapitalRoute
   '/world': typeof WorldRoute
   '/api/agent-bus': typeof ApiAgentBusRoute
+  '/api/agent-files': typeof ApiAgentFilesRoute
   '/api/artifacts': typeof ApiArtifactsRouteWithChildren
   '/api/auth': typeof ApiAuthRoute
   '/api/auth-check': typeof ApiAuthCheckRoute
@@ -1358,6 +1374,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/agent-files': typeof AgentFilesRoute
   '/agora': typeof AgoraRoute
   '/conductor': typeof ConductorRoute
   '/dashboard': typeof DashboardRoute
@@ -1381,6 +1398,7 @@ export interface FileRoutesById {
   '/vt-capital': typeof VtCapitalRoute
   '/world': typeof WorldRoute
   '/api/agent-bus': typeof ApiAgentBusRoute
+  '/api/agent-files': typeof ApiAgentFilesRoute
   '/api/artifacts': typeof ApiArtifactsRouteWithChildren
   '/api/auth': typeof ApiAuthRoute
   '/api/auth-check': typeof ApiAuthCheckRoute
@@ -1528,6 +1546,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/$'
+    | '/agent-files'
     | '/agora'
     | '/conductor'
     | '/dashboard'
@@ -1551,6 +1570,7 @@ export interface FileRouteTypes {
     | '/vt-capital'
     | '/world'
     | '/api/agent-bus'
+    | '/api/agent-files'
     | '/api/artifacts'
     | '/api/auth'
     | '/api/auth-check'
@@ -1696,6 +1716,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/$'
+    | '/agent-files'
     | '/agora'
     | '/conductor'
     | '/dashboard'
@@ -1718,6 +1739,7 @@ export interface FileRouteTypes {
     | '/vt-capital'
     | '/world'
     | '/api/agent-bus'
+    | '/api/agent-files'
     | '/api/artifacts'
     | '/api/auth'
     | '/api/auth-check'
@@ -1863,6 +1885,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/$'
+    | '/agent-files'
     | '/agora'
     | '/conductor'
     | '/dashboard'
@@ -1886,6 +1909,7 @@ export interface FileRouteTypes {
     | '/vt-capital'
     | '/world'
     | '/api/agent-bus'
+    | '/api/agent-files'
     | '/api/artifacts'
     | '/api/auth'
     | '/api/auth-check'
@@ -2032,6 +2056,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   SplatRoute: typeof SplatRoute
+  AgentFilesRoute: typeof AgentFilesRoute
   AgoraRoute: typeof AgoraRoute
   ConductorRoute: typeof ConductorRoute
   DashboardRoute: typeof DashboardRoute
@@ -2055,6 +2080,7 @@ export interface RootRouteChildren {
   VtCapitalRoute: typeof VtCapitalRoute
   WorldRoute: typeof WorldRoute
   ApiAgentBusRoute: typeof ApiAgentBusRoute
+  ApiAgentFilesRoute: typeof ApiAgentFilesRoute
   ApiArtifactsRoute: typeof ApiArtifactsRouteWithChildren
   ApiAuthRoute: typeof ApiAuthRoute
   ApiAuthCheckRoute: typeof ApiAuthCheckRoute
@@ -2319,6 +2345,13 @@ declare module '@tanstack/react-router' {
       path: '/agora'
       fullPath: '/agora'
       preLoaderRoute: typeof AgoraRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/agent-files': {
+      id: '/agent-files'
+      path: '/agent-files'
+      fullPath: '/agent-files'
+      preLoaderRoute: typeof AgentFilesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/$': {
@@ -2893,6 +2926,13 @@ declare module '@tanstack/react-router' {
       path: '/api/artifacts'
       fullPath: '/api/artifacts'
       preLoaderRoute: typeof ApiArtifactsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/agent-files': {
+      id: '/api/agent-files'
+      path: '/api/agent-files'
+      fullPath: '/api/agent-files'
+      preLoaderRoute: typeof ApiAgentFilesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/agent-bus': {
@@ -3577,6 +3617,7 @@ const ApiHermesworldReservationsRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   SplatRoute: SplatRoute,
+  AgentFilesRoute: AgentFilesRoute,
   AgoraRoute: AgoraRoute,
   ConductorRoute: ConductorRoute,
   DashboardRoute: DashboardRoute,
@@ -3600,6 +3641,7 @@ const rootRouteChildren: RootRouteChildren = {
   VtCapitalRoute: VtCapitalRoute,
   WorldRoute: WorldRoute,
   ApiAgentBusRoute: ApiAgentBusRoute,
+  ApiAgentFilesRoute: ApiAgentFilesRoute,
   ApiArtifactsRoute: ApiArtifactsRouteWithChildren,
   ApiAuthRoute: ApiAuthRoute,
   ApiAuthCheckRoute: ApiAuthCheckRoute,

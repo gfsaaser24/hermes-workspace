@@ -747,7 +747,7 @@ function ChatSidebarComponent({
     (state) => state.settings.experimentalEchoStudio,
   )
   const mainRoutes = ['/chat', '/new', '/files', '/terminal']
-  const knowledgeRoutes = ['/memory', '/skills']
+  const knowledgeRoutes = ['/memory', '/skills', '/agent-files']
   const systemRoutes = ['/settings', '/logs']
 
   useEffect(() => {
@@ -1040,6 +1040,14 @@ function ChatSidebarComponent({
       icon: UserMultipleIcon,
       label: t('nav.profiles'),
       active: pathname === '/profiles',
+    },
+    {
+      // hermes-jcmm: per-agent file editor (SOUL/AGENTS/config/memories/...)
+      kind: 'link',
+      to: '/agent-files',
+      icon: PuzzleIcon,
+      label: 'Agent Files',
+      active: pathname === '/agent-files',
     },
   ]
 
