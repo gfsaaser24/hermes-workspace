@@ -64,6 +64,7 @@ import {
   emitSearchModalEvent,
 } from '@/hooks/use-search-modal'
 import { setLocalModelOverride } from '@/screens/chat/local-model-override'
+import { NEW_CHAT_MODEL_KEY } from '@/stores/session-model-store'
 import { formatModelName } from '@/lib/format-model-name'
 
 type ChatComposerAttachment = {
@@ -1009,8 +1010,10 @@ function ChatComposerComponent({
     },
   })
   const currentModelQuery = useQuery({
-    queryKey: ['claude', 'session-status-model', sessionKey || 'main'],
-    queryFn: () => fetchCurrentModelFromStatus(sessionKey),
+    // hermes-jcmm: a new chat reads the gateway DEFAULT ('new'), never the
+    // floating 'main' alias, so the label cannot drift between chats.
+    queryKey: ['claude', 'session-status-model', sessionKey || 'new'],
+    queryFn: () => fetchCurrentModelFromStatus(sessionKey || 'new'),
     refetchInterval: 30_000,
     retry: false,
   })
@@ -1118,6 +1121,9 @@ function ChatComposerComponent({
     s.getModel(modelSessionKey),
   )
   const setPersistedSessionModel = useSessionModelStore((s) => s.setModel)
+  const clearPersistedSessionModel = useSessionModelStore((s) => s.clearModel)
+  // hermes-jcmm: a pick that is still being written to the agent.
+  const modelPickInFlightRef = useRef<string | null>(null)
 
   // Model switching is now per-session via the persistent store above.
   // Previously this issued a PATCH /api/hermes-proxy/api/config to write to
@@ -1142,14 +1148,43 @@ function ChatComposerComponent({
       }
       setModelNotice(null)
       const resolved = getResolvedModelKey(model, provider)
-      // Per-session, browser-local persistence. No global config write —
-      // picking a model here only affects this chat. The actual model is
-      // passed on each request via the chat-completion `model` field.
+      // Optimistic, browser-local value so the label updates instantly.
       setPersistedSessionModel(normalizedSessionKey, resolved)
       setIsModelMenuOpen(false)
+      // hermes-jcmm: the agent is the source of truth. For an existing
+      // session, lock the pick on the gateway RIGHT NOW (Hermes per-session
+      // model lock), then re-read session-status. A new chat has no session
+      // yet; its pick is locked when the first message creates it.
+      if (normalizedSessionKey !== NEW_CHAT_MODEL_KEY && normalizedSessionKey !== 'new') {
+        modelPickInFlightRef.current = resolved
+        void (async () => {
+          try {
+            const res = await fetch(
+              `/api/claude-proxy/api/sessions/${encodeURIComponent(normalizedSessionKey)}/model`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: resolved }),
+              },
+            )
+            if (!res.ok) {
+              const text = await res.text().catch(() => '')
+              toast(`Model change was not saved on the agent (${res.status}) ${text.slice(0, 120)}`)
+              return
+            }
+            await queryClient.invalidateQueries({ queryKey: ['claude', 'session-status-model'] })
+            await queryClient.invalidateQueries({ queryKey: ['claude', 'sessions'] })
+          } catch (err) {
+            toast(`Model change was not saved on the agent: ${err instanceof Error ? err.message : String(err)}`)
+          } finally {
+            if (modelPickInFlightRef.current === resolved) modelPickInFlightRef.current = null
+          }
+        })()
+      }
     },
     [
       gatewayModeQuery.data,
+      queryClient,
       sessionKey,
       setPersistedSessionModel,
       zeroForkModelInfoFlags,
@@ -1192,6 +1227,17 @@ function ChatComposerComponent({
     'Workspace'
 
   const currentModel = currentModelQuery.data ?? ''
+  // hermes-jcmm: the agent is the source of truth for an existing session.
+  // Once session-status reports a model and no pick is in flight, drop the
+  // browser-local optimistic value so every device shows the same thing.
+  useEffect(() => {
+    if (!sessionKey || modelSessionKey === NEW_CHAT_MODEL_KEY) return
+    if (!currentModel || !persistedSessionModel) return
+    if (modelPickInFlightRef.current) return
+    if (isCurrentModel(currentModel, persistedSessionModel, '') || currentModel === persistedSessionModel) {
+      clearPersistedSessionModel(modelSessionKey)
+    }
+  }, [clearPersistedSessionModel, currentModel, modelSessionKey, persistedSessionModel, sessionKey])
 
   // Auto-switch to hermes-agent model on mount (Hermes Workspace uses Hermes Agent)
   // Removed: auto-switch to hermes-agent. The workspace respects the
