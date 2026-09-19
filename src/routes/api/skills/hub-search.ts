@@ -5,6 +5,7 @@ import { promisify } from 'node:util'
 import { createFileRoute } from '@tanstack/react-router'
 import { json } from '@tanstack/react-start'
 import { isAuthenticated } from '../../../server/auth-middleware'
+import { dashboardFetch, ensureGatewayProbed } from '../../../server/gateway-capabilities'
 
 const execFileAsync = promisify(execFile)
 
@@ -19,6 +20,11 @@ type SkillSearchResult = {
   trust: string
   installCommand: string
   installed: boolean
+  // hermes-jcmm: extra fields the Skills screen reads for hub results
+  identifier?: string
+  trust_level?: string
+  repo?: string | null
+  homepage?: string | null
 }
 
 type SkillSearchPayload = {
@@ -133,6 +139,64 @@ async function searchBundledSkills(
   }
 }
 
+
+/**
+ * hermes-jcmm: the official Hermes dashboard exposes the skills hub
+ * (GET /api/skills/hub/search) and runs in the agent container, so use it
+ * instead of spawning a python that needs the agent's venv.
+ */
+async function searchDashboardSkillsHub(
+  query: string,
+  limit: number,
+  source: string,
+): Promise<SkillSearchPayload> {
+  const capabilities = await ensureGatewayProbed()
+  if (!capabilities.dashboard.available) throw new Error('dashboard unavailable')
+  const params = new URLSearchParams({ q: query, limit: String(limit), source: source || 'all' })
+  const res = await dashboardFetch(`/api/skills/hub/search?${params.toString()}`, {
+    signal: AbortSignal.timeout(45_000),
+  })
+  if (!res.ok) throw new Error(`dashboard hub search ${res.status}`)
+  const data = (await res.json()) as {
+    results?: Array<Record<string, unknown>>
+    installed?: Record<string, unknown>
+    source_counts?: Record<string, number>
+    timed_out?: Array<string>
+  }
+  const installed = new Set(Object.keys(data.installed || {}))
+  const results = (data.results || []).map((r) => {
+    const identifier = normalizeText(r.identifier)
+    const name = normalizeText(r.name) || identifier
+    const repo = normalizeText(r.repo)
+    const src = normalizeText(r.source)
+    return {
+      id: identifier || name,
+      name,
+      description: normalizeText(r.description),
+      author: repo.split('/')[0] || src || 'hub',
+      category: src,
+      tags: Array.isArray(r.tags) ? r.tags.map(String) : [],
+      source: src,
+      identifier,
+      trust: normalizeText(r.trust_level) || 'community',
+      trust_level: normalizeText(r.trust_level) || 'community',
+      repo: repo || null,
+      installCommand: identifier ? `hermes skills install ${identifier}` : '',
+      homepage: repo ? `https://github.com/${repo}` : null,
+      installed: installed.has(identifier) || installed.has(name),
+    }
+  })
+  return {
+    ok: true,
+    results,
+    source: 'hermes-dashboard',
+    total: results.length,
+    ...(data.timed_out && data.timed_out.length
+      ? { warning: `Some hub sources timed out: ${data.timed_out.join(', ')}` }
+      : {}),
+  }
+}
+
 async function searchPythonSkillsHub(
   query: string,
   limit: number,
@@ -174,9 +238,13 @@ export const Route = createFileRoute('/api/skills/hub-search')({
           }
 
           try {
-            return json(await searchPythonSkillsHub(query, limit, source))
+            return json(await searchDashboardSkillsHub(query, limit, source))
           } catch {
-            return json(await searchBundledSkills(query, limit))
+            try {
+              return json(await searchPythonSkillsHub(query, limit, source))
+            } catch {
+              return json(await searchBundledSkills(query, limit))
+            }
           }
         } catch (error) {
           return json(
