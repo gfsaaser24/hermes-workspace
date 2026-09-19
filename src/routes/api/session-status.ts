@@ -10,8 +10,7 @@ import {
 import {
   isSyntheticSessionKey,
   resolveMainChatSessionId,
-  shouldBindMainToPortableSession,
-} from '../../server/session-utils'
+  shouldBindMainToPortableSession, hasRealMainSession } from '../../server/session-utils'
 import { getLocalSession } from '../../server/local-session-store'
 import { getActiveRunForSession } from '../../server/run-store'
 import { isAuthenticated } from '@/server/auth-middleware'
@@ -51,7 +50,10 @@ export const Route = createFileRoute('/api/session-status')({
           const url = new URL(request.url)
           const requestedKey = url.searchParams.get('sessionKey')?.trim() || ''
           let sessionKey = requestedKey || 'main'
-          const pinPortableMain = shouldBindMainToPortableSession({
+          const realMain = sessionKey === 'main' && (await hasRealMainSession())
+          const pinPortableMain =
+            !realMain &&
+            shouldBindMainToPortableSession({
             sessionKey,
             dashboardAvailable: capabilities.dashboard.available,
             enhancedChat: capabilities.enhancedChat,
@@ -78,7 +80,7 @@ export const Route = createFileRoute('/api/session-status')({
             })
           }
 
-          if (sessionKey === 'main' && !pinPortableMain) {
+          if (sessionKey === 'main' && !pinPortableMain && !realMain) {
             try {
               const sessions = await listSessions(30, 0)
               const candidate = resolveMainChatSessionId(sessions)

@@ -7,12 +7,12 @@ import {
   getMessages,
   listSessions,
   toChatMessage,
+  getSession,
 } from '../../server/claude-api'
 import {
   resolveMainChatSessionId,
   resolveSessionKey,
-  shouldBindMainToPortableSession,
-} from '../../server/session-utils'
+  shouldBindMainToPortableSession, hasRealMainSession } from '../../server/session-utils'
 import { isAuthenticated } from '@/server/auth-middleware'
 import { getLocalSession, getLocalMessages } from '../../server/local-session-store'
 
@@ -44,11 +44,14 @@ export const Route = createFileRoute('/api/history')({
             friendlyId,
             defaultKey: 'main',
           })
-          const pinPortableMain = shouldBindMainToPortableSession({
-            sessionKey,
-            dashboardAvailable: capabilities.dashboard.available,
-            enhancedChat: capabilities.enhancedChat,
-          })
+          const realMain = sessionKey === 'main' && (await hasRealMainSession())
+          const pinPortableMain =
+            !realMain &&
+            shouldBindMainToPortableSession({
+              sessionKey,
+              dashboardAvailable: capabilities.dashboard.available,
+              enhancedChat: capabilities.enhancedChat,
+            })
           // Keep /chat/new empty until the first message creates a real session.
           if (sessionKey === 'new') {
             return json({
@@ -65,7 +68,7 @@ export const Route = createFileRoute('/api/history')({
           //   2. The most recent non-internal session with messages.
           // Cron + Operations per-agent sessions are skipped so the
           // orchestrator chat doesn't latch onto runtime junk.
-          if (sessionKey === 'main' && !pinPortableMain) {
+          if (sessionKey === 'main' && !pinPortableMain && !realMain) {
             try {
               const sessions = await listSessions(30, 0)
               const candidate = resolveMainChatSessionId(sessions)
