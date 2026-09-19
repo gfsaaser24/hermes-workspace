@@ -294,8 +294,8 @@ export function AgentFilesScreen() {
             className={
               'rounded-full px-3 py-1 text-xs ' +
               (a.id === agentId
-                ? 'bg-primary-900 text-white dark:bg-white dark:text-neutral-900'
-                : 'bg-primary-100 text-primary-800 hover:bg-primary-200 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700')
+                ? 'bg-neutral-900 text-white ring-1 ring-white/40 dark:bg-neutral-950 dark:text-white'
+                : 'bg-neutral-200 text-neutral-800 hover:bg-neutral-300 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700')
             }
           >
             {a.label}
