@@ -55,9 +55,9 @@ export function shouldBlockZeroForkModelSwitch(
   mode: string | null | undefined,
   flags: ZeroForkModelInfoFlags,
 ): boolean {
-  return (
-    mode === 'zero-fork' &&
-    flags.vanillaAgent &&
-    !flags.supportsRuntimeSwitching
-  )
+  // hermes-jcmm: our agent honors a per-request `model` (route aliases and
+  // `provider::model`) on the session-chat endpoints, so never block the pick.
+  void mode
+  void flags
+  return false
 }

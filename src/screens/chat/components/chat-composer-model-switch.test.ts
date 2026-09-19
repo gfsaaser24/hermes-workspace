@@ -12,7 +12,7 @@ describe('zero-fork model switch guard', () => {
         vanillaAgent: true,
         supportsRuntimeSwitching: false,
       }),
-    ).toBe(true)
+    ).toBe(false) // hermes-jcmm: per-request models are always allowed
 
     expect(
       shouldBlockZeroForkModelSwitch('enhanced-fork', {
@@ -42,7 +42,7 @@ describe('zero-fork model switch guard', () => {
       vanillaAgent: true,
       supportsRuntimeSwitching: false,
     })
-    expect(shouldBlockZeroForkModelSwitch('zero-fork', flags)).toBe(true)
+    expect(shouldBlockZeroForkModelSwitch('zero-fork', flags)).toBe(false) // hermes-jcmm: never blocked
   })
 
   it('keeps the toast copy stable', () => {

@@ -920,6 +920,7 @@ function ChatComposerComponent({
     return window.matchMedia('(max-width: 767px)').matches
   })
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false)
+  const [modelSearch, setModelSearch] = useState('') // hermes-jcmm: model picker search
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false)
   const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false)
   const [isThinkingMenuOpen, setIsThinkingMenuOpen] = useState(false)
@@ -2963,11 +2964,31 @@ function ChatComposerComponent({
                             </button>
                             {isModelMenuOpen && (
                               <>
-                                <div className="fixed inset-0 z-[199]" onClick={() => setIsModelMenuOpen(false)} />
+                                <div className="fixed inset-0 z-[199]" onClick={() => { setModelSearch(''); setIsModelMenuOpen(false) }} />
                                 <div className="absolute bottom-full left-0 mb-2 z-[200] w-[min(28rem,calc(100vw-2rem))] min-w-[18rem] origin-bottom-left overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-xl dark:border-neutral-700 dark:bg-neutral-900 animate-in fade-in slide-in-from-bottom-2 duration-150">
+                                  {/* hermes-jcmm: search box (filters id / name / provider) */}
+                                  <div className="border-b border-neutral-200 p-1.5 dark:border-neutral-700">
+                                    <input
+                                      type="search"
+                                      autoFocus
+                                      value={modelSearch}
+                                      onChange={(e) => setModelSearch(e.target.value)}
+                                      onKeyDown={(e) => { if (e.key === 'Escape') { setModelSearch(''); setIsModelMenuOpen(false) } }}
+                                      placeholder="Search models…"
+                                      aria-label="Search models"
+                                      className="w-full rounded-md border border-neutral-200 bg-white px-2 py-1 text-sm outline-none focus:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-800 dark:focus:border-neutral-500"
+                                    />
+                                  </div>
                                   <div className="max-h-[20rem] overflow-y-auto overflow-x-hidden p-1">
                                     {(() => {
-                                      const allModels = modelsQuery.data?.models ?? []
+                                      const q = modelSearch.trim().toLowerCase()
+                                      const allModels = (modelsQuery.data?.models ?? []).filter((m) => {
+                                        if (!q) return true
+                                        const rec = typeof m === 'string' ? { id: m } : (m as Record<string, unknown>)
+                                        const hay = [rec.id, rec.name, rec.displayName, rec.label, rec.model, rec.provider]
+                                          .filter((v) => typeof v === 'string').join(' ').toLowerCase()
+                                        return q.split(/\s+/).every((t) => hay.includes(t))
+                                      })
                                       const defaultProvider = modelsQuery.data?.currentProvider ?? ''
                                       if (allModels.length === 0) {
                                         return <div className="p-4 text-center text-sm text-neutral-500">No models available</div>
