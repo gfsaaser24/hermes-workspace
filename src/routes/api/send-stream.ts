@@ -28,6 +28,7 @@ import {
   ensureGatewayProbed,
   getGatewayCapabilities,
   getMessages as getSessionMessagesFromAgent,
+  getSession as getSessionFromAgent,
   listSessions,
   lockSessionModel,
   streamChat,
@@ -887,6 +888,17 @@ export const Route = createFileRoute('/api/send-stream')({
                 // chat doesn't latch onto them.
                 let reused: string | null = null
                 if (sessionKey === 'main') {
+                  // hermes-jcmm: if the gateway has a real session whose id is
+                  // literally 'main', use it — never re-route the user's
+                  // message into "whatever chat was most recently active".
+                  try {
+                    const real = await getSessionFromAgent('main')
+                    if (real && real.id === 'main') reused = 'main'
+                  } catch {
+                    // no real 'main' session; fall through to the legacy alias
+                  }
+                }
+                if (sessionKey === 'main' && !reused) {
                   try {
                     const recent = await listSessions(30, 0)
                     const isInternal = (id: string) =>

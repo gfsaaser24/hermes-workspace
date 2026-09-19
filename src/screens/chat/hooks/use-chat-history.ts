@@ -273,7 +273,8 @@ export function useChatHistory({
   const explicitRouteSessionKey = useMemo(() => {
     const normalizedFriendlyId = normalizeSessionCandidate(activeFriendlyId)
     if (!normalizedFriendlyId) return ''
-    if (normalizedFriendlyId === 'main') return ''
+    // hermes-jcmm: 'main' is a real gateway session id on our deployment;
+    // load its history like any other route key.
     return normalizedFriendlyId
   }, [activeFriendlyId])
   const normalizedForcedSessionKey = useMemo(

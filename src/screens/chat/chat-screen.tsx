@@ -1001,15 +1001,21 @@ export function ChatScreen({
     staleTime: 5 * 60 * 1000, // 5 minutes
   })
 
+  // hermes-jcmm: a brand-new chat must read the GATEWAY DEFAULT ('new'), never
+  // the floating 'main' alias (= whichever chat was most recently active), or
+  // the composer label drifts on every refetch/focus.
+  const currentModelStatusKey = isNewChat
+    ? 'new'
+    : resolvedSessionKey || activeFriendlyId || 'main'
   const currentModelQuery = useQuery({
     queryKey: [
       'claude',
       'session-status-model',
-      resolvedSessionKey || activeFriendlyId || 'main',
+      currentModelStatusKey,
     ],
     queryFn: async () => {
       try {
-        const statusSessionKey = resolvedSessionKey || activeFriendlyId || 'main'
+        const statusSessionKey = currentModelStatusKey
         const query = statusSessionKey
           ? `?sessionKey=${encodeURIComponent(statusSessionKey)}`
           : ''
