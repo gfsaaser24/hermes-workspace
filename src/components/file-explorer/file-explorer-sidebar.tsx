@@ -6,7 +6,9 @@ import {
   Download01Icon,
   File01Icon,
   Folder01Icon,
+  FolderAddIcon,
   Image01Icon,
+  MoreHorizontalIcon,
   Pen01Icon,
   PlusSignIcon,
   RefreshIcon,
@@ -47,6 +49,9 @@ type FileExplorerSidebarProps = {
   onOpenFile?: (entry: FileEntry) => void
   // Path of the currently-open file, used to highlight the row.
   activePath?: string | null
+  // Called after a file or folder was deleted so parents can close an editor
+  // that still shows it. Receives the deleted entry's path.
+  onDeleted?: (path: string) => void
   hidden?: boolean
   className?: string
 }
@@ -92,6 +97,32 @@ function buildReference(pathValue: string) {
   return `See file: workspace/${normalized}`
 }
 
+// Find the entries that live directly inside `folderPath` ('' = root).
+function findChildren(
+  entries: Array<FileEntry>,
+  folderPath: string,
+): Array<FileEntry> {
+  if (!folderPath) return entries
+  const target = normalizePath(folderPath)
+  for (const entry of entries) {
+    if (entry.type !== 'folder') continue
+    const entryPath = normalizePath(entry.path)
+    if (entryPath === target) return entry.children || []
+    if (target.startsWith(`${entryPath}/`)) {
+      return findChildren(entry.children || [], folderPath)
+    }
+  }
+  return []
+}
+
+// Read the error message the /api/files handler returns on failure.
+async function readApiError(res: Response, fallback: string) {
+  const data = (await res.json().catch(() => null)) as {
+    error?: unknown
+  } | null
+  return typeof data?.error === 'string' ? data.error : fallback
+}
+
 async function fetchFileTree(): Promise<Array<FileEntry>> {
   const res = await fetch('/api/files?action=list')
   if (!res.ok) throw new Error('Failed to load files')
@@ -126,6 +157,7 @@ export function FileExplorerSidebar({
   onInsertReference,
   onOpenFile,
   activePath = null,
+  onDeleted,
   hidden = false,
   className,
 }: FileExplorerSidebarProps) {
@@ -137,6 +169,11 @@ export function FileExplorerSidebar({
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [promptState, setPromptState] = useState<PromptState | null>(null)
   const [promptValue, setPromptValue] = useState('')
+  const [promptError, setPromptError] = useState<string | null>(null)
+  const [promptBusy, setPromptBusy] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState<FileEntry | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
   const [previewPath, setPreviewPath] = useState<string | null>(null)
   const uploadTargetRef = useRef<string>('')
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
@@ -193,6 +230,12 @@ export function FileExplorerSidebar({
   const openPrompt = useCallback((state: PromptState) => {
     setPromptState(state)
     setPromptValue(state.defaultValue || '')
+    setPromptError(null)
+  }, [])
+
+  // Open the row action menu (right-click or the "⋯" button) at a point.
+  const openMenu = useCallback((entry: FileEntry, x: number, y: number) => {
+    setContextMenu({ x, y, entry })
   }, [])
 
   const handleRename = useCallback(
@@ -220,18 +263,35 @@ export function FileExplorerSidebar({
     [openPrompt],
   )
 
-  const handleDelete = useCallback(
-    async (entry: FileEntry) => {
-      if (!window.confirm(`Move ${entry.name} to trash?`)) return
-      await fetch('/api/files', {
+  const handleDelete = useCallback((entry: FileEntry) => {
+    setDeleteTarget(entry)
+    setDeleteError(null)
+  }, [])
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!deleteTarget) return
+    setDeleteBusy(true)
+    setDeleteError(null)
+    try {
+      const res = await fetch('/api/files', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'delete', path: entry.path }),
+        body: JSON.stringify({ action: 'delete', path: deleteTarget.path }),
       })
+      if (!res.ok) {
+        throw new Error(
+          await readApiError(res, `Delete failed (${res.status})`),
+        )
+      }
+      onDeleted?.(deleteTarget.path)
+      setDeleteTarget(null)
       await refresh()
-    },
-    [refresh],
-  )
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDeleteBusy(false)
+    }
+  }, [deleteTarget, onDeleted, refresh])
 
   const handleDownload = useCallback(async (entry: FileEntry) => {
     const res = await fetch(
@@ -270,46 +330,62 @@ export function FileExplorerSidebar({
   )
 
   const handlePromptSubmit = useCallback(async () => {
-    if (!promptState) return
+    if (!promptState || promptBusy) return
     const value = promptValue.trim()
     if (!value) return
-
-    if (promptState.mode === 'rename') {
-      const parent = getParentPath(promptState.targetPath)
-      const nextPath = parent ? `${parent}/${value}` : value
-      await fetch('/api/files', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          action: 'rename',
-          from: promptState.targetPath,
-          to: nextPath,
-        }),
-      })
-    } else if (promptState.mode === 'new-folder') {
-      const nextPath = promptState.targetPath
-        ? `${promptState.targetPath}/${value}`
-        : value
-      await fetch('/api/files', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'mkdir', path: nextPath }),
-      })
-    } else {
-      const nextPath = promptState.targetPath
-        ? `${promptState.targetPath}/${value}`
-        : value
-      await fetch('/api/files', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'write', path: nextPath, content: '' }),
-      })
+    if (value === '.' || value === '..' || /[\\/]/.test(value)) {
+      setPromptError('Names cannot contain slashes.')
+      return
     }
 
-    setPromptState(null)
-    setPromptValue('')
-    await refresh()
-  }, [promptState, promptValue, refresh])
+    // Names are checked against the loaded tree so a new file/folder never
+    // silently overwrites an existing one (the `write` action would).
+    const parent =
+      promptState.mode === 'rename'
+        ? getParentPath(promptState.targetPath)
+        : promptState.targetPath
+    const nextPath = parent ? `${parent}/${value}` : value
+    if (
+      nextPath !== promptState.targetPath &&
+      findChildren(entries, parent).some((entry) => entry.name === value)
+    ) {
+      setPromptError(`"${value}" already exists here.`)
+      return
+    }
+
+    const body =
+      promptState.mode === 'rename'
+        ? { action: 'rename', from: promptState.targetPath, to: nextPath }
+        : promptState.mode === 'new-folder'
+          ? { action: 'mkdir', path: nextPath }
+          : { action: 'write', path: nextPath, content: '' }
+
+    setPromptBusy(true)
+    setPromptError(null)
+    try {
+      const res = await fetch('/api/files', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        throw new Error(
+          await readApiError(res, `Request failed (${res.status})`),
+        )
+      }
+      // Show the new item: open the folder it was created in.
+      if (promptState.mode !== 'rename' && parent) {
+        setExpanded((prev) => new Set(prev).add(parent))
+      }
+      setPromptState(null)
+      setPromptValue('')
+      await refresh()
+    } catch (err) {
+      setPromptError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPromptBusy(false)
+    }
+  }, [entries, promptBusy, promptState, promptValue, refresh])
 
   const handleFileClick = useCallback(
     (entry: FileEntry) => {
@@ -332,44 +408,68 @@ export function FileExplorerSidebar({
       const Icon = getFileIcon(entry)
       const isExpanded = isSearchActive ? true : expanded.has(entry.path)
       const padding = 12 + depth * 14
+      const isActive = activePath === entry.path && entry.type === 'file'
+      const isMenuTarget = contextMenu?.entry.path === entry.path
 
       return (
         <div key={entry.path}>
-          <button
-            type="button"
-            onClick={() => handleFileClick(entry)}
+          <div
+            className={cn(
+              'group relative flex items-center rounded-md',
+              'hover:bg-primary-200',
+              isActive && 'bg-accent-100 hover:bg-accent-100',
+              isMenuTarget && !isActive && 'bg-primary-200',
+            )}
             onContextMenu={(event) => {
               event.preventDefault()
-              setContextMenu({
-                x: event.clientX,
-                y: event.clientY,
-                entry,
-              })
+              event.stopPropagation()
+              openMenu(entry, event.clientX, event.clientY)
             }}
-            className={cn(
-              'group flex w-full items-center gap-2 rounded-md py-1.5 text-left text-sm text-primary-900',
-              'hover:bg-primary-200',
-              activePath === entry.path &&
-                entry.type === 'file' &&
-                'bg-accent-100 font-medium text-accent-800 hover:bg-accent-100',
-            )}
-            style={{ paddingLeft: padding }}
           >
-            {entry.type === 'folder' ? (
-              <span
-                className={cn(
-                  'transition-transform',
-                  isExpanded ? 'rotate-90' : 'rotate-0',
-                )}
-              >
-                <HugeiconsIcon icon={ArrowRight01Icon} size={16} />
-              </span>
-            ) : (
-              <span className="w-4" />
-            )}
-            <HugeiconsIcon icon={Icon} size={18} strokeWidth={1.6} />
-            <span className="truncate">{entry.name}</span>
-          </button>
+            <button
+              type="button"
+              onClick={() => handleFileClick(entry)}
+              className={cn(
+                'flex min-w-0 flex-1 items-center gap-2 py-1.5 pr-8 text-left text-sm text-primary-900',
+                isActive && 'font-medium text-accent-800',
+              )}
+              style={{ paddingLeft: padding }}
+            >
+              {entry.type === 'folder' ? (
+                <span
+                  className={cn(
+                    'transition-transform',
+                    isExpanded ? 'rotate-90' : 'rotate-0',
+                  )}
+                >
+                  <HugeiconsIcon icon={ArrowRight01Icon} size={16} />
+                </span>
+              ) : (
+                <span className="w-4" />
+              )}
+              <HugeiconsIcon icon={Icon} size={18} strokeWidth={1.6} />
+              <span className="truncate">{entry.name}</span>
+            </button>
+            {/* Row actions: same menu as right-click, for mouse-less users. */}
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                const rect = event.currentTarget.getBoundingClientRect()
+                openMenu(entry, rect.right - 160, rect.bottom + 2)
+              }}
+              title={`Actions for ${entry.name}`}
+              aria-label={`Actions for ${entry.name}`}
+              className={cn(
+                'absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-primary-600',
+                'opacity-0 transition-opacity hover:bg-primary-300/60 hover:text-primary-900',
+                'group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100',
+                isMenuTarget && 'opacity-100',
+              )}
+            >
+              <HugeiconsIcon icon={MoreHorizontalIcon} size={16} />
+            </button>
+          </div>
           {entry.type === 'folder' && isExpanded && entry.children?.length ? (
             <div>
               {entry.children.map((child) => renderEntry(child, depth + 1))}
@@ -378,7 +478,14 @@ export function FileExplorerSidebar({
         </div>
       )
     },
-    [activePath, expanded, handleFileClick, isSearchActive, setContextMenu],
+    [
+      activePath,
+      contextMenu,
+      expanded,
+      handleFileClick,
+      isSearchActive,
+      openMenu,
+    ],
   )
 
   if (hidden) return null
@@ -413,6 +520,14 @@ export function FileExplorerSidebar({
             title="Upload"
           >
             <HugeiconsIcon icon={Upload01Icon} size={18} />
+          </Button>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            onClick={() => openPrompt({ mode: 'new-folder', targetPath: '' })}
+            title="New folder"
+          >
+            <HugeiconsIcon icon={FolderAddIcon} size={18} />
           </Button>
           <Button
             size="icon-sm"
@@ -494,6 +609,16 @@ export function FileExplorerSidebar({
                 >
                   <HugeiconsIcon icon={PlusSignIcon} size={16} />
                   New file
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    openPrompt({ mode: 'new-folder', targetPath: '' })
+                  }
+                >
+                  <HugeiconsIcon icon={FolderAddIcon} size={16} />
+                  New folder
                 </Button>
                 <Button
                   size="sm"
@@ -586,7 +711,7 @@ export function FileExplorerSidebar({
           <button
             className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-red-700 hover:bg-red-50/80"
             onClick={() => {
-              void handleDelete(contextMenu.entry)
+              handleDelete(contextMenu.entry)
               setContextMenu(null)
             }}
           >
@@ -617,13 +742,74 @@ export function FileExplorerSidebar({
             </DialogDescription>
             <input
               value={promptValue}
-              onChange={(event) => setPromptValue(event.target.value)}
+              onChange={(event) => {
+                setPromptValue(event.target.value)
+                setPromptError(null)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                  event.preventDefault()
+                  void handlePromptSubmit()
+                }
+              }}
+              placeholder={
+                promptState?.mode === 'new-folder' ? 'folder-name' : 'file.md'
+              }
               className="w-full rounded-md border border-primary-200 bg-primary-50 px-3 py-2 text-sm text-primary-900 focus:outline-none focus:ring-2 focus:ring-primary-300"
               autoFocus
             />
+            {promptError ? (
+              <p className="text-xs text-red-600">{promptError}</p>
+            ) : null}
             <div className="flex justify-end gap-2 pt-2">
               <DialogClose render={<Button variant="outline">Cancel</Button>} />
-              <Button onClick={handlePromptSubmit}>Save</Button>
+              <Button
+                onClick={() => void handlePromptSubmit()}
+                disabled={promptBusy || !promptValue.trim()}
+              >
+                {promptState?.mode === 'rename' ? 'Rename' : 'Create'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </DialogRoot>
+
+      <DialogRoot
+        open={Boolean(deleteTarget)}
+        onOpenChange={(open) => {
+          if (!open && !deleteBusy) setDeleteTarget(null)
+        }}
+      >
+        <DialogContent>
+          <div className="p-5 space-y-3">
+            <DialogTitle>
+              Delete {deleteTarget?.type === 'folder' ? 'folder' : 'file'}
+            </DialogTitle>
+            <DialogDescription>
+              Delete <strong>{deleteTarget?.name}</strong>?
+              {deleteTarget?.type === 'folder'
+                ? ' Everything inside it will be deleted too.'
+                : ''}{' '}
+              This cannot be undone.
+            </DialogDescription>
+            {deleteError ? (
+              <p className="text-xs text-red-600">{deleteError}</p>
+            ) : null}
+            <div className="flex justify-end gap-2 pt-2">
+              <DialogClose
+                render={
+                  <Button variant="outline" disabled={deleteBusy}>
+                    Cancel
+                  </Button>
+                }
+              />
+              <Button
+                variant="destructive"
+                onClick={() => void handleDeleteConfirm()}
+                disabled={deleteBusy}
+              >
+                {deleteBusy ? 'Deleting…' : 'Delete'}
+              </Button>
             </div>
           </div>
         </DialogContent>
