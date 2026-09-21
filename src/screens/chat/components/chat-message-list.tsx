@@ -1118,6 +1118,18 @@ function ChatMessageListComponent({
     .filter(({ message }) => message.role === 'user')
     .map(({ index }) => index)
     .pop()
+  // hermes-jcmm: sourceIndex of the last user message. The "last assistant is
+  // the streaming one" fallback below must not pick the PREVIOUS turn's reply
+  // in the moment between a send and its placeholder appearing — that bubble
+  // then rendered the new run's live tool calls on top of its own.
+  const lastUserSourceIndex = visibleEntries
+    .filter(({ message }) => message.role === 'user')
+    .map(({ sourceIndex }) => sourceIndex)
+    .pop()
+  const lastAssistantIsCurrentTurn =
+    typeof lastAssistantIndex === 'number' &&
+    (typeof lastUserSourceIndex !== 'number' ||
+      lastAssistantIndex > lastUserSourceIndex)
   // Show typing indicator when waiting for response and no visible text yet.
   // Bug 2 fix: also show during grace period (thinkingGrace) so there's no
   // blank-space flash between waitingForResponse clearing and the response
@@ -1314,7 +1326,9 @@ function ChatMessageListComponent({
     const messageId = message.__optimisticId || (message as any).id
     return (
       messageId === streamingMessageId ||
-      (message.role === 'assistant' && index === lastAssistantIndex)
+      (message.role === 'assistant' &&
+        lastAssistantIsCurrentTurn &&
+        index === lastAssistantIndex)
     )
   }
 
