@@ -3050,7 +3050,15 @@ export function ChatScreen({
             <ChatComposer
               onSubmit={send}
               onAbort={handleAbortStreaming}
-              isLoading={sending || waitingForResponse}
+              // hermes-jcmm: Stop must stay reachable for the whole run — a
+              // live local stream or a re-attached run counts, not only the
+              // waiting flag (which several fallbacks may clear early).
+              isLoading={
+                sending ||
+                waitingForResponse ||
+                localIsStreaming ||
+                Boolean(resumedRunId)
+              }
               disabled={sending || hideUi}
               sessionKey={
                 isNewChat
