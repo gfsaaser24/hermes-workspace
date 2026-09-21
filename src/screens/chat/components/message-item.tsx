@@ -9,6 +9,7 @@ import {
 import { MessageActionsBar } from './message-actions-bar'
 import {
   buildHermesActivitySummary,
+  mergeToolSectionsById,
   shouldAutoExpandHermesActivityCard,
 } from './streaming-activity-ui'
 import { TuiActivityCard } from './tui-activity-card'
@@ -2447,27 +2448,29 @@ function MessageItemComponent({
   )
   const inlineToolSections = useMemo<Array<InlineToolSection>>(
     () => [
-      ...streamToolSections,
-      ...toolParts.map((toolPart, index) => {
-        const rawOutput = toolPart.output
-        let outputText = ''
-        if (rawOutput) {
-          if (typeof rawOutput.output === 'string') {
-            outputText = rawOutput.output
-          } else {
-            outputText = JSON.stringify(rawOutput, null, 2)
+      ...mergeToolSectionsById(
+        streamToolSections,
+        toolParts.map((toolPart, index) => {
+          const rawOutput = toolPart.output
+          let outputText = ''
+          if (rawOutput) {
+            if (typeof rawOutput.output === 'string') {
+              outputText = rawOutput.output
+            } else {
+              outputText = JSON.stringify(rawOutput, null, 2)
+            }
           }
-        }
 
-        return {
-          key: toolPart.toolCallId || `${toolPart.type}-${index}`,
-          type: toolPart.type,
-          input: toolPart.input,
-          outputText,
-          errorText: toolPart.errorText,
-          state: toolPart.state,
-        }
-      }),
+          return {
+            key: toolPart.toolCallId || `${toolPart.type}-${index}`,
+            type: toolPart.type,
+            input: toolPart.input,
+            outputText,
+            errorText: toolPart.errorText,
+            state: toolPart.state,
+          }
+        }),
+      ),
       ...attachedToolSections,
     ],
     [attachedToolSections, streamToolSections, toolParts],

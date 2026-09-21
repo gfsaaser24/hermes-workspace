@@ -102,3 +102,28 @@ describe('streaming activity ui helpers', () => {
     })
   })
 })
+
+describe('hermes-jcmm: a tool call is counted once', () => {
+  it('drops the persisted twin of a streamed tool section', async () => {
+    const { mergeToolSectionsById } = await import('./streaming-activity-ui')
+    const stream = [{ key: 'call_1', type: 'terminal' }]
+    const persisted = [
+      { key: 'call_1', type: 'terminal' },
+      { key: 'call_2', type: 'read_file' },
+    ]
+    expect(mergeToolSectionsById(stream, persisted).map((s) => s.key)).toEqual([
+      'call_1',
+      'call_2',
+    ])
+  })
+
+  it('keeps everything when ids do not overlap', async () => {
+    const { mergeToolSectionsById } = await import('./streaming-activity-ui')
+    expect(
+      mergeToolSectionsById(
+        [{ key: 'a', type: 'x' }],
+        [{ key: 'b', type: 'y' }],
+      ).length,
+    ).toBe(2)
+  })
+})

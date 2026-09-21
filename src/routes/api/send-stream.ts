@@ -719,6 +719,24 @@ export const Route = createFileRoute('/api/send-stream')({
                   rawSessionKey ||
                   portableSessionKey
                 let accumulated = ''
+                // hermes-jcmm: the turn's LAST assistant segment — the text
+                // streamed since the most recent tool event. v0.21.3 keeps
+                // its own per-message transcript ("one" row, "two" row, …,
+                // "DONE" row) and /api/history reads that agent transcript
+                // before the local fallback store, so a `done` message
+                // carrying the whole turn shows twice: once as the realtime
+                // bubble and once as the "DONE" transcript row (the
+                // chat-store dedupes by exact text, which cannot match).
+                // `accumulated` still drives the live chunks and the local
+                // fallback row; only the answer we finish on is the segment.
+                let currentSegment = ''
+                const beginPortableSegment = () => {
+                  currentSegment = ''
+                }
+                // Never finish on nothing: a turn whose last event was a tool
+                // call falls back to everything we saw.
+                const finalPortableText = () =>
+                  currentSegment.trim() ? currentSegment : accumulated
 
                 activeRunId = runId
                 registerActiveSendRun(runId)
@@ -817,6 +835,7 @@ export const Route = createFileRoute('/api/send-stream')({
                         touchUpstream()
                         if (ev.kind === 'text.delta') {
                           accumulated += ev.delta
+                          currentSegment += ev.delta
                           persistActiveRun((runSessionKey, activeId) =>
                             appendRunText(
                               runSessionKey,
@@ -834,6 +853,9 @@ export const Route = createFileRoute('/api/send-stream')({
                           continue
                         }
                         if (ev.kind === 'tool.started') {
+                          // Segment boundary: the text before this call
+                          // belongs to the message that made it.
+                          beginPortableSegment()
                           toolStateByCallId.set(ev.callId, {
                             name: ev.name,
                             args: ev.args,
@@ -872,6 +894,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           continue
                         }
                         if (ev.kind === 'tool.output') {
+                          beginPortableSegment()
                           const state = toolStateByCallId.get(ev.callId)
                           const argsForCard =
                             state?.args && typeof state.args === 'object'
@@ -908,6 +931,8 @@ export const Route = createFileRoute('/api/send-stream')({
                           throw new Error(ev.error)
                         }
                       }
+                      // The local store stays whole-turn: it is only the
+                      // fallback history for boxes with no agent transcript.
                       appendLocalMessage(portableSessionKey, {
                         id: crypto.randomUUID(),
                         role: 'assistant',
@@ -915,6 +940,15 @@ export const Route = createFileRoute('/api/send-stream')({
                         timestamp: Date.now(),
                       })
                       touchLocalSession(portableSessionKey)
+                      const responsesFinalText = finalPortableText()
+                      persistActiveRun((runSessionKey, activeId) =>
+                        appendRunText(
+                          runSessionKey,
+                          activeId,
+                          responsesFinalText,
+                          { replace: true },
+                        ),
+                      )
                       persistActiveRun((runSessionKey, activeId) =>
                         markRunStatus(runSessionKey, activeId, 'complete'),
                       )
@@ -926,7 +960,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           role: 'assistant',
                           content: [
                             ...(thinking ? [{ type: 'thinking', thinking }] : []),
-                            { type: 'text', text: accumulated },
+                            { type: 'text', text: responsesFinalText },
                           ],
                         },
                       })
@@ -942,6 +976,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       )
                       // Reset accumulated so the fallback starts clean.
                       accumulated = ''
+                      beginPortableSegment()
                     }
                   }
 
@@ -972,6 +1007,9 @@ export const Route = createFileRoute('/api/send-stream')({
                         runId,
                       })
                     } else if (chunk.type === 'tool') {
+                      // Segment boundary — the agent may talk again after
+                      // this call, and that reply is the one to finish on.
+                      beginPortableSegment()
                       // Prefer the gateway's stable tool_call_id so 'running'
                       // and 'completed' events for the same call collapse to
                       // one card row. Fall back to a synthetic id only when
@@ -1008,6 +1046,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       })
                     } else {
                       accumulated += chunk.text
+                      currentSegment += chunk.text
                       persistActiveRun((runSessionKey, activeId) =>
                         appendRunText(runSessionKey, activeId, accumulated, {
                           replace: true,
@@ -1022,7 +1061,9 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
                   }
 
-                  // Persist assistant response to local session store
+                  // Persist assistant response to local session store.
+                  // Whole-turn on purpose: this row is only the fallback
+                  // history for boxes whose agent keeps no transcript.
                   appendLocalMessage(portableSessionKey, {
                     id: crypto.randomUUID(),
                     role: 'assistant',
@@ -1031,6 +1072,15 @@ export const Route = createFileRoute('/api/send-stream')({
                   })
                   touchLocalSession(portableSessionKey)
 
+                  // hermes-jcmm: finish on the last segment, not the whole
+                  // turn — the mid-run chunks above kept the live bubble
+                  // continuous, this is the answer the client keeps.
+                  const portableFinalText = finalPortableText()
+                  persistActiveRun((runSessionKey, activeId) =>
+                    appendRunText(runSessionKey, activeId, portableFinalText, {
+                      replace: true,
+                    }),
+                  )
                   persistActiveRun((runSessionKey, activeId) =>
                     markRunStatus(runSessionKey, activeId, 'complete'),
                   )
@@ -1042,7 +1092,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       role: 'assistant',
                       content: [
                         ...(thinking ? [{ type: 'thinking', thinking }] : []),
-                        { type: 'text', text: accumulated },
+                        { type: 'text', text: portableFinalText },
                       ],
                     },
                   })
@@ -1131,6 +1181,30 @@ export const Route = createFileRoute('/api/send-stream')({
               // directly to useStreamingMessage. Skip publishChatEvent to prevent
               // useRealtimeChatHistory from creating duplicate message bubbles.
               const skipPublish = true
+
+              // hermes-jcmm: a turn can hold SEVERAL assistant messages —
+              // the agent talks ("one"), runs a tool, talks again ("two"),
+              // ... and finishes with "DONE". Every assistant.delta lands on
+              // one message_id, and v0.21.3 closes the turn with a single
+              // assistant.completed whose `content` is the whole turn glued
+              // together (gateway/platforms/api_server.py `_run_and_signal`).
+              // Accumulating all of that into the answer left the browser
+              // with a realtime bubble holding every intermediate reply while
+              // the transcript held only "DONE" — the chat-store dedupes the
+              // `done` message against history by exact text, so both showed
+              // until a reload. Track the CURRENT assistant message on its
+              // own: reset on a tool boundary and on the first delta after a
+              // message was closed.
+              let currentAssistantText = ''
+              let assistantMessageClosed = false
+              const beginAssistantMessage = () => {
+                currentAssistantText = ''
+                assistantMessageClosed = false
+              }
+              // The agent's thinking deltas replace (see setRunThinking), so
+              // the latest one is the whole reasoning block. Kept so the
+              // `done` message can carry it the way the portable path does.
+              let lastThinkingText = ''
 
               // hermes-jcmm: Hermes Agent v0.21.3 DOES emit tool.* SSE events
               // live (gateway/platforms/api_server.py `_tool_progress` enqueues
@@ -1327,12 +1401,26 @@ export const Route = createFileRoute('/api/send-stream')({
                     if (event === 'assistant.completed') {
                       // Send full content as a chunk — covers cases where
                       // deltas were missed or response was too short for streaming
-                      const content =
+                      const payloadContent =
                         typeof data.content === 'string' ? data.content : ''
+                      // hermes-jcmm: `content` is the WHOLE turn on v0.21.3,
+                      // intermediate replies included. When deltas streamed
+                      // we already know the last assistant message's own text
+                      // — use it so the full replace repaints just that
+                      // message. Fall back to the payload when nothing
+                      // streamed (short answers, missed deltas).
+                      // A blank payload stays blank — it is skipped below,
+                      // the same as before.
+                      const content =
+                        payloadContent.trim() && currentAssistantText.trim()
+                          ? currentAssistantText
+                          : payloadContent
+                      assistantMessageClosed = true
                       // hermes-jcmm: whitespace-only counts as empty. This is
                       // a full replace — letting '   ' through wiped both the
                       // persisted run text and the text already on screen.
                       if (content.trim()) {
+                        currentAssistantText = content
                         persistActiveRun((runSessionKey, activeId) =>
                           appendRunText(runSessionKey, activeId, content, {
                             replace: true,
@@ -1354,6 +1442,9 @@ export const Route = createFileRoute('/api/send-stream')({
                       const delta =
                         typeof data.delta === 'string' ? data.delta : ''
                       if (!delta) return
+                      // A delta after a closed message starts the next one.
+                      if (assistantMessageClosed) beginAssistantMessage()
+                      currentAssistantText += delta
                       persistActiveRun((runSessionKey, activeId) =>
                         appendRunText(runSessionKey, activeId, delta),
                       )
@@ -1373,6 +1464,9 @@ export const Route = createFileRoute('/api/send-stream')({
                       event === 'tool.calling' ||
                       event === 'tool.running'
                     ) {
+                      // A tool call ends the assistant message that asked
+                      // for it; whatever it said belongs to that message.
+                      beginAssistantMessage()
                       const toolName = getToolName(data)
                       const preview =
                         typeof data.preview === 'string'
@@ -1411,6 +1505,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const toolName = getToolName(data)
                       if (toolName === '_thinking' || toolName === 'tool') {
                         if (!delta) return
+                        lastThinkingText = delta
                         persistActiveRun((runSessionKey, activeId) =>
                           setRunThinking(runSessionKey, activeId, delta),
                         )
@@ -1448,6 +1543,7 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'tool.completed') {
+                      beginAssistantMessage()
                       const toolName = getToolName(data)
                       const resultPreview = getToolResultPreview(data)
                       const translated = {
@@ -1554,6 +1650,7 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'tool.failed') {
+                      beginAssistantMessage()
                       const errorMessage =
                         readString(
                           (data.error as Record<string, unknown> | undefined)
@@ -1710,31 +1807,59 @@ export const Route = createFileRoute('/api/send-stream')({
                         )
                       }
 
+                      // hermes-jcmm: the answer a turn ends on is its LAST
+                      // assistant message. run.completed carries the
+                      // authoritative per-turn transcript exactly so clients
+                      // that accumulated assistant.delta into one buffer can
+                      // reconcile against ground truth, so prefer it; then
+                      // the session transcript; then the text we tracked for
+                      // the current (last) assistant message.
+                      //
+                      // This also covers the older bug it replaces: a run
+                      // could finish with assistantText: '' when no
+                      // assistant.delta arrived and assistant.completed
+                      // carried blank `content`, leaving a finished run with
+                      // a blank reply in history.
+                      //
+                      // Queued BEFORE markRunStatus: both writes go through the
+                      // run-store queue for this run, so they stay ordered.
+                      const finalText =
+                        readFinalAssistantText(data) ||
+                        transcriptFinalText ||
+                        currentAssistantText
+                      if (finalText.trim()) {
+                        persistActiveRun((runSessionKey, activeId) =>
+                          appendRunText(runSessionKey, activeId, finalText, {
+                            replace: true,
+                          }),
+                        )
+                      }
                       const translated = {
                         state: 'complete',
                         sessionKey: sessionKeyFromEvent,
                         runId,
-                      }
-                      // hermes-jcmm: a run could finish with assistantText: ''
-                      // even though the agent's final message had text — no
-                      // assistant.delta arrived and assistant.completed carried
-                      // an empty/blank `content`. Nothing wrote the answer, so
-                      // the history page showed a blank reply for a finished
-                      // run. When no text ever reached the client, take the
-                      // final message off run.completed (its authoritative
-                      // per-turn transcript) or off the session transcript.
-                      // Queued BEFORE markRunStatus: both writes go through the
-                      // run-store queue for this run, so they stay ordered.
-                      if (!resumeText.trim()) {
-                        const finalText =
-                          readFinalAssistantText(data) || transcriptFinalText
-                        if (finalText.trim()) {
-                          persistActiveRun((runSessionKey, activeId) =>
-                            appendRunText(runSessionKey, activeId, finalText, {
-                              replace: true,
-                            }),
-                          )
-                        }
+                        // The authoritative final message, so the chat-store
+                        // stops rebuilding it from its own delta buffer (which
+                        // holds the whole turn) and its exact-text dedupe
+                        // against the transcript row lands.
+                        ...(finalText.trim()
+                          ? {
+                              message: {
+                                role: 'assistant',
+                                content: [
+                                  ...(lastThinkingText
+                                    ? [
+                                        {
+                                          type: 'thinking',
+                                          thinking: lastThinkingText,
+                                        },
+                                      ]
+                                    : []),
+                                  { type: 'text', text: finalText },
+                                ],
+                              },
+                            }
+                          : {}),
                       }
                       persistActiveRun((runSessionKey, activeId) =>
                         markRunStatus(runSessionKey, activeId, 'complete'),

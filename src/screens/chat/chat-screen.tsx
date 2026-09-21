@@ -1509,9 +1509,19 @@ export function ChatScreen({
     // that overlaps with the streaming text. If so, drop the streaming
     // placeholder to avoid showing the same response twice.
     const streamingText = stableActiveStreamingText.trim()
-    const hasServerAssistantVersion = nextMessages.some((msg) => {
+    // hermes-jcmm: only a message that arrived AFTER the last user message can
+    // be this run's reply. Scanning the whole thread let an earlier turn with
+    // the same tool-call shape swallow the placeholder; derivedStreamingInfo
+    // then pointed streamingMessageId at the PREVIOUS turn's bubble, which
+    // rendered the live tool calls on top of its own ("1 running · 3 done").
+    const lastUserIdxForMatch = nextMessages.reduce(
+      (lastIdx, msg, idx) => (msg.role === 'user' ? idx : lastIdx),
+      -1,
+    )
+    const hasServerAssistantVersion = nextMessages.some((msg, idx) => {
       if (msg.role !== 'assistant') return false
       if (msg.__streamingStatus === 'streaming') return false
+      if (idx <= lastUserIdxForMatch) return false
       // Any non-streaming assistant message that appears after the last user
       // message is potentially the same response — match by text overlap
       if (streamingText.length > 0) {

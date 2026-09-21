@@ -162,3 +162,19 @@ export function shouldRenderStreamingThoughtSummary({
 
   return !hasRevealedText && streamToolCount === 0
 }
+
+// hermes-jcmm: a finished message can carry the same tool call twice — once
+// as a persisted `toolCall` content block and once in `__streamToolCalls`
+// (embedded by the chat-store on `done` so pills survive fast runs). Both
+// lists were concatenated, so every finished turn showed double its tool
+// count ("2 tools used" for one call). Prefer the live/stream section and
+// drop the persisted twin with the same tool-call id. Sections without a
+// real id cannot be matched and are kept.
+export function mergeToolSectionsById<T extends { key: string; type: string }>(
+  streamSections: ReadonlyArray<T>,
+  persistedSections: ReadonlyArray<T>,
+): Array<T> {
+  const seen = new Set(streamSections.map((section) => section.key))
+  const rest = persistedSections.filter((section) => !seen.has(section.key))
+  return [...streamSections, ...rest]
+}
