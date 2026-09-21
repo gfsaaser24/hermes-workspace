@@ -23,7 +23,7 @@ import {
   registerRunAbort,
   unregisterRunAbort,
 } from '../../server/run-stream-bus'
-import { getChatMode } from '../../server/gateway-capabilities'
+import { forceReprobeGateway, getChatMode } from '../../server/gateway-capabilities'
 import { appendLocalMessage, ensureLocalSession, getLocalMessages, touchLocalSession } from '../../server/local-session-store'
 import { getDiscoveredModels, getLocalProviderDef } from '../../server/local-provider-discovery'
 import { openaiChat } from '../../server/openai-compat-api'
@@ -357,6 +357,26 @@ export const Route = createFileRoute('/api/send-stream')({
         const csrfCheck = requireJsonContentType(request)
         if (csrfCheck) return csrfCheck
         await ensureGatewayProbed()
+        // hermes-jcmm: right after a deploy the Workspace boots before the
+        // agent's API server listens, the first probe says "disconnected" and
+        // that answer is cached for 15s. A send inside that window skipped the
+        // portable path and hit /api/sessions/{id}/chat/stream for a session
+        // the agent had never seen (404, empty stream, run stuck 'accepted').
+        // Ask again with the real request in hand; refuse plainly if the agent
+        // is really down instead of guessing a transport.
+        if (getChatMode() === 'disconnected') {
+          await forceReprobeGateway()
+          if (getChatMode() === 'disconnected') {
+            return new Response(
+              JSON.stringify({
+                ok: false,
+                error:
+                  'Hermes gateway is not reachable yet — wait a few seconds and send again.',
+              }),
+              { status: 503, headers: { 'Content-Type': 'application/json' } },
+            )
+          }
+        }
 
         // Read body manually to handle large payloads (image attachments
         // can push the JSON body above the default ~1MB parse limit).
