@@ -557,7 +557,8 @@ export function useOperations() {
     const parsed = configQuery.data?.parsed
     const allAgents = normalizeAgentList(parsed?.agents?.list)
     // Filter out system/internal agents — only show operations agents
-    const HIDDEN_AGENTS = new Set(['main', 'pc1-coder', 'pc1-planner', 'pc1-critic'])
+    // hermes-jcmm: our primary persona profile is literally named `main`; do not hide it.
+    const HIDDEN_AGENTS = new Set(['pc1-coder', 'pc1-planner', 'pc1-critic'])
     const configAgents = allAgents.filter((a) => !HIDDEN_AGENTS.has(a.id))
     const sessions = sessionsQuery.data ?? []
     const cronJobs = cronJobsQuery.data ?? []

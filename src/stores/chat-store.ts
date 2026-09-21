@@ -725,6 +725,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const rawText = extractMessageText(event.message)
           if (
             rawText.startsWith('Pre-compaction memory flush') ||
+            // hermes-jcmm: hermes-lcm compaction summary rows arrive as
+            // role 'user'; they are context, not chat.
+            rawText.startsWith('[CONTEXT COMPACTION') ||
             rawText.includes('Store durable memories now') ||
             rawText.includes('APPEND new content only and do not overwrite') ||
             rawText.startsWith('A subagent task') ||

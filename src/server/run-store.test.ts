@@ -45,4 +45,35 @@ describe('run-store persistence', () => {
       events.map((event) => event.text).sort(),
     )
   })
+  it('keeps a user Stop final when the upstream abort reports an error afterwards', async () => {
+    const { createPersistedRun, getPersistedRun, markRunStatus } =
+      await import('./run-store')
+    await createPersistedRun({ runId: 'run-stop', sessionKey: 'session-1' })
+    await markRunStatus('session-1', 'run-stop', 'stopped')
+    // send-stream's catch on the abort we just triggered
+    await markRunStatus('session-1', 'run-stop', 'error', 'This operation was aborted')
+    const stored = await getPersistedRun('session-1', 'run-stop')
+    expect(stored?.status).toBe('stopped')
+    expect(stored?.errorMessage).toBeUndefined()
+  })
+
+  it('keeps a quiet run re-attachable while this process still owns it', async () => {
+    // A single long tool call writes nothing for > 5 min; the run is still
+    // alive as long as its upstream stream is open in this process.
+    const { createPersistedRun, getActiveRunForSession, markRunStatus } =
+      await import('./run-store')
+    await createPersistedRun({ runId: 'run-long', sessionKey: 'session-1' })
+    await markRunStatus('session-1', 'run-long', 'active')
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(Date.now() + 6 * 60 * 1000)
+      expect(await getActiveRunForSession('session-1')).toBeNull()
+      const owned = await getActiveRunForSession('session-1', {
+        isOwned: (runId) => runId === 'run-long',
+      })
+      expect(owned?.runId).toBe('run-long')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

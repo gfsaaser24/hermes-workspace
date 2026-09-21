@@ -5,6 +5,7 @@
  * Replaces legacy WebSocket connection for the Hermes Workspace fork.
  */
 
+import { parseCompactionNode } from './lcm-stats'
 import {
   BEARER_TOKEN,
   CLAUDE_API,
@@ -20,6 +21,7 @@ import {
   forkSession as forkDashboardSession,
   getSession as getDashboardSession,
   getSessionMessages as getDashboardSessionMessages,
+  getSessionMessagesWithCompacted as getDashboardSessionMessagesWithCompacted,
   listSessions as listDashboardSessions,
   searchSessions as searchDashboardSessions,
   updateSession as updateDashboardSession,
@@ -212,6 +214,30 @@ export async function getMessages(
   return resp.items ?? resp.data ?? resp.messages ?? []
 }
 
+// hermes-jcmm: history view — include rows an earlier compaction folded away
+// (capped; the live-run poller keeps using getMessages, the latest page).
+export async function getMessagesWithCompacted(
+  sessionId: string,
+  maxRows = 2000,
+): Promise<Array<ClaudeMessage>> {
+  if (getCapabilities().dashboard.available) {
+    const resp = await getDashboardSessionMessagesWithCompacted(sessionId, maxRows)
+    return resp.messages as Array<ClaudeMessage>
+  }
+  return getMessages(sessionId)
+}
+
+// hermes-jcmm: the row a compaction leaves behind (hermes-lcm `[Recent Summary
+// …]`, stock `[CONTEXT COMPACTION …]`), persisted with role 'user'. Rendered as
+// a divider in the chat, never as something the user typed.
+const COMPACTION_ROW_PREFIXES = ['[Recent Summary', '[CONTEXT COMPACTION']
+export function isCompactionRowText(text: string | null | undefined): boolean {
+  const trimmed = (text ?? '').trimStart()
+  return COMPACTION_ROW_PREFIXES.some((prefix) => trimmed.startsWith(prefix))
+}
+export const COMPACTION_MARKER_TEXT =
+  '[CONTEXT COMPACTION] Older messages were compacted into a summary here.'
+
 export async function searchSessions(
   query: string,
   limit = 20,
@@ -296,15 +322,25 @@ export function toChatMessage(
     })
   }
 
-  if (msg.content && msg.role !== 'tool') {
-    content.push({ type: 'text', text: msg.content })
+  const compactionMarker =
+    msg.role === 'user' && isCompactionRowText(msg.content)
+  const displayText = compactionMarker ? COMPACTION_MARKER_TEXT : msg.content
+
+  if (displayText && msg.role !== 'tool') {
+    content.push({ type: 'text', text: displayText })
   }
 
   return {
     id: `msg-${msg.id}`,
     role: msg.role,
     content,
-    text: msg.content || '',
+    text: displayText || '',
+    ...(compactionMarker
+      ? {
+          __compactionMarker: true,
+          __compactionNode: parseCompactionNode(msg.content),
+        }
+      : {}),
     timestamp: msg.timestamp ? msg.timestamp * 1000 : Date.now(),
     createdAt: msg.timestamp
       ? new Date(msg.timestamp * 1000).toISOString()
@@ -319,10 +355,23 @@ export function toChatMessage(
   }
 }
 
+// hermes-jcmm: the dashboard's `preview` is the first user message cut to a
+// few dozen chars, so the injected `<workspace_context …/>` header (see
+// lib/workspace-message-scope.ts) arrives truncated and unclosed. Drop it
+// however much of it survived; an empty result means "no usable preview".
+const WORKSPACE_DIRECTIVE_PREFIX_RE = /^\s*<workspace_context\b[^>]*(?:>|$)\s*/i
+export function stripWorkspaceDirectivePreview(
+  preview: string | null | undefined,
+): string | undefined {
+  const text = (preview ?? '').replace(WORKSPACE_DIRECTIVE_PREFIX_RE, '').trim()
+  return text || undefined
+}
+
 /** Convert a ClaudeSession to the session summary format the frontend expects */
 export function toSessionSummary(
   session: ClaudeSession,
 ): Record<string, unknown> {
+  const preview = stripWorkspaceDirectivePreview(session.preview)
   return {
     key: session.id,
     friendlyId: session.id,
@@ -331,8 +380,8 @@ export function toSessionSummary(
     model: session.model || '',
     label: session.title || undefined,
     title: session.title || undefined,
-    derivedTitle: session.title || session.preview || undefined,
-    preview: session.preview || undefined,
+    derivedTitle: session.title || preview || undefined,
+    preview,
     tokenCount: (session.input_tokens ?? 0) + (session.output_tokens ?? 0),
     totalTokens: (session.input_tokens ?? 0) + (session.output_tokens ?? 0),
     message_count: session.message_count ?? 0,
@@ -371,6 +420,52 @@ type StreamChatOptions = {
  * Send a chat message and stream SSE events from Hermes Agent FastAPI.
  * Returns a promise that resolves when the stream ends.
  */
+/**
+ * hermes-jcmm: persist the picked model ON THE AGENT for this session
+ * (POST /api/sessions/{id}/model — Hermes' per-session model lock), so the
+ * choice is stateful across devices/reloads and wins over the global default.
+ * Best-effort: never throws.
+ */
+export async function lockSessionModel(sessionId: string, model: string): Promise<void> {
+  const id = sessionId.trim()
+  const m = model.trim()
+  if (!id || !m || id === 'new') return
+  try {
+    await fetch(`${CLAUDE_API}/api/sessions/${encodeURIComponent(id)}/model`, {
+      method: 'POST',
+      headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: m }),
+      signal: AbortSignal.timeout(5000),
+    })
+  } catch (err) {
+    console.warn(`[claude-api] session model lock failed for ${id}: ${err instanceof Error ? err.message : err}`)
+  }
+}
+
+/**
+ * hermes-jcmm: best-effort agent-side stop for an explicit user Stop.
+ * The durable-run API (POST /v1/runs/{id}/stop) only knows runs it admitted,
+ * so this quietly no-ops when the id came from the session chat stream.
+ */
+export async function stopAgentRun(runId: string): Promise<boolean> {
+  const id = runId.trim()
+  if (!id) return false
+  try {
+    const res = await fetch(
+      `${CLAUDE_API}/v1/runs/${encodeURIComponent(id)}/stop`,
+      {
+        method: 'POST',
+        headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: AbortSignal.timeout(5000),
+      },
+    )
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 export async function streamChat(
   sessionId: string,
   body: {

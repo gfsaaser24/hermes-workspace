@@ -66,6 +66,57 @@ export function createSyntheticLiveToolTracker(): SyntheticLiveToolTracker {
   }
 }
 
+/**
+ * hermes-jcmm: the run-start snapshot used to tell "messages this run wrote"
+ * apart from prior turns.
+ *
+ * A plain array length is NOT enough: the Hermes dashboard pages
+ * `GET /api/sessions/{id}/messages` to the newest 500 rows when no `limit` is
+ * sent (hermes_cli/web_routers/sessions.py). On a long session the array
+ * length stays pinned at 500, so `slice(baselineCount)` is always empty and no
+ * live tool card is ever emitted. Anchor on the highest row id instead and keep
+ * the count only as a fallback for stores that don't expose numeric ids.
+ */
+export type RunMessageWindow = {
+  baselineCount: number
+  baselineMaxId: number
+}
+
+function readRowId(message: Record<string, unknown>): number {
+  const id = Number(message.id)
+  return Number.isFinite(id) ? id : Number.NaN
+}
+
+export function createRunMessageWindow(
+  baseline: Array<Record<string, unknown>> | null | undefined,
+): RunMessageWindow {
+  if (!Array.isArray(baseline)) return { baselineCount: 0, baselineMaxId: 0 }
+  let baselineMaxId = 0
+  for (const message of baseline) {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime safety
+    if (!message) continue
+    const id = readRowId(message)
+    if (Number.isFinite(id) && id > baselineMaxId) baselineMaxId = id
+  }
+  return { baselineCount: baseline.length, baselineMaxId }
+}
+
+export function selectRunMessages(
+  window: RunMessageWindow,
+  messages: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(messages)) return []
+  if (window.baselineMaxId > 0) {
+    return messages.filter((message) => {
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime safety
+      if (!message) return false
+      const id = readRowId(message)
+      return Number.isFinite(id) && id > window.baselineMaxId
+    })
+  }
+  return messages.slice(window.baselineCount)
+}
+
 export function collectSyntheticLiveToolEvents({
   messages,
   tracker,

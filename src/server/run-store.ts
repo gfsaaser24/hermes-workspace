@@ -23,7 +23,16 @@ export type PersistedRunState = {
   runId: string
   sessionKey: string
   friendlyId: string
-  status: 'accepted' | 'active' | 'handoff' | 'stalled' | 'complete' | 'error'
+  // hermes-jcmm: 'stopped' = an explicit user Stop. Terminal, like
+  // complete/error, so nothing re-attaches to it.
+  status:
+    | 'accepted'
+    | 'active'
+    | 'handoff'
+    | 'stalled'
+    | 'complete'
+    | 'error'
+    | 'stopped'
   createdAt: number
   updatedAt: number
   lastEventAt: number
@@ -33,6 +42,12 @@ export type PersistedRunState = {
   lifecycleEvents: Array<PersistedRunLifecycleEvent>
   errorMessage?: string
 }
+
+const TERMINAL_STATUSES: ReadonlySet<PersistedRunState['status']> = new Set([
+  'complete',
+  'error',
+  'stopped',
+])
 
 const RUNS_ROOT = path.join(getHermesRoot(), 'webui-mvp', 'runs')
 const runUpdateQueues = new Map<string, Promise<void>>()
@@ -46,7 +61,9 @@ function sessionDir(sessionKey: string): string {
 }
 
 function runPath(sessionKey: string, runId: string): string {
-  return path.join(sessionDir(sessionKey), `${runId}.json`)
+  // hermes-jcmm: runId reaches this from a URL param — encode it so a
+  // '../..' id cannot escape the session directory.
+  return path.join(sessionDir(sessionKey), `${encodeURIComponent(runId)}.json`)
 }
 
 async function ensureDir(dir: string): Promise<void> {
@@ -136,6 +153,13 @@ export async function updatePersistedRun(
   })
 }
 
+// hermes-jcmm: a write queued before a Stop must never resurrect the run.
+function keepTerminal(
+  status: PersistedRunState['status'],
+): PersistedRunState['status'] {
+  return TERMINAL_STATUSES.has(status) ? status : 'active'
+}
+
 export async function appendRunText(
   sessionKey: string,
   runId: string,
@@ -144,7 +168,7 @@ export async function appendRunText(
 ): Promise<PersistedRunState | null> {
   return updatePersistedRun(sessionKey, runId, (run) => ({
     ...run,
-    status: 'active',
+    status: keepTerminal(run.status),
     lastEventAt: Date.now(),
     assistantText: options?.replace ? text : `${run.assistantText}${text}`,
   }))
@@ -157,7 +181,7 @@ export async function setRunThinking(
 ): Promise<PersistedRunState | null> {
   return updatePersistedRun(sessionKey, runId, (run) => ({
     ...run,
-    status: 'active',
+    status: keepTerminal(run.status),
     lastEventAt: Date.now(),
     thinkingText,
   }))
@@ -175,7 +199,8 @@ export async function upsertRunToolCall(
     else nextToolCalls.push(toolCall)
     return {
       ...run,
-      status: toolCall.phase === 'error' ? 'error' : 'active',
+      status:
+        toolCall.phase === 'error' ? 'error' : keepTerminal(run.status),
       lastEventAt: Date.now(),
       toolCalls: nextToolCalls,
       ...(toolCall.phase === 'error' && toolCall.result
@@ -203,12 +228,18 @@ export async function markRunStatus(
   status: PersistedRunState['status'],
   errorMessage?: string,
 ): Promise<PersistedRunState | null> {
-  return updatePersistedRun(sessionKey, runId, (run) => ({
-    ...run,
-    status,
-    lastEventAt: Date.now(),
-    ...(errorMessage ? { errorMessage } : {}),
-  }))
+  return updatePersistedRun(sessionKey, runId, (run) => {
+    // hermes-jcmm: a user Stop is final. The upstream abort it triggers
+    // reports "This operation was aborted" as an error right after — keep
+    // 'stopped' so the UI does not show a failure the user asked for.
+    if (run.status === 'stopped' && status === 'error') return run
+    return {
+      ...run,
+      status,
+      lastEventAt: Date.now(),
+      ...(errorMessage ? { errorMessage } : {}),
+    }
+  })
 }
 
 // A run that hasn't been touched in this long is considered orphaned (e.g.
@@ -217,6 +248,7 @@ export async function markRunStatus(
 // "active" makes every chat re-open show a phantom "Thinking…" indicator
 // until the 120s client-side failsafe clears it.
 const STALE_RUN_THRESHOLD_MS = 5 * 60 * 1000
+
 
 async function readRunsInDir(dir: string): Promise<Array<PersistedRunState>> {
   const files = (await readdir(dir)).filter((name) => name.endsWith('.json'))
@@ -236,13 +268,23 @@ async function readRunsInDir(dir: string): Promise<Array<PersistedRunState>> {
 
 export async function getActiveRunForSession(
   sessionKey: string,
+  options?: {
+    // hermes-jcmm: a run this process still owns (its upstream stream is
+    // open) is alive no matter how long its last write was — a single
+    // long tool call (> 5 min) must stay re-attachable after a reload.
+    isOwned?: (runId: string) => boolean
+  },
 ): Promise<PersistedRunState | null> {
   try {
     const runs = await readRunsInDir(sessionDir(sessionKey))
     const now = Date.now()
+    const isOwned = options?.isOwned ?? (() => false)
     const candidates = runs
-      .filter((run) => !['complete', 'error'].includes(run.status))
-      .filter((run) => now - run.updatedAt < STALE_RUN_THRESHOLD_MS)
+      .filter((run) => !TERMINAL_STATUSES.has(run.status))
+      .filter(
+        (run) =>
+          isOwned(run.runId) || now - run.updatedAt < STALE_RUN_THRESHOLD_MS,
+      )
       .sort((a, b) => b.updatedAt - a.updatedAt)
     return candidates[0] ?? null
   } catch {
@@ -262,7 +304,7 @@ export async function listAllActiveRuns(): Promise<Array<PersistedRunState>> {
     const runsBySession = await Promise.all(sessionDirs.map(readRunsInDir))
     return runsBySession
       .flat()
-      .filter((run) => !['complete', 'error'].includes(run.status))
+      .filter((run) => !TERMINAL_STATUSES.has(run.status))
       .sort((a, b) => b.updatedAt - a.updatedAt)
   } catch {
     return []

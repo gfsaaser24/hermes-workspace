@@ -9,6 +9,7 @@ import { listSessions } from '@/server/claude-api'
 import { getLocalMessages, getLocalSession } from './local-session-store'
 import { getActiveRunForSession } from './run-store'
 import {
+  hasRealMainSession,
   resolveMainChatSessionId,
   shouldBindMainToPortableSession,
 } from '@/server/session-utils'
@@ -140,6 +141,81 @@ export function estimateContextTokensFromSessionUsage(
   return Math.ceil(totalInput / calls)
 }
 
+// hermes-jcmm: the exact size of the LAST prompt this session sent. Hermes
+// stores it on the session as model_config._usage_anchor.prompt_tokens
+// (a JSON string on the dashboard payload). This is the real "how full is
+// the window" number — the old estimate divided the session's lifetime
+// input tokens by the call count, which after a compaction (7.5M tokens /
+// 380 calls) had nothing to do with the current context.
+export function readUsageAnchorPromptTokens(
+  sessionData: Record<string, unknown>,
+): number {
+  const raw = sessionData.model_config
+  let config: unknown = raw
+  if (typeof raw === 'string') {
+    try {
+      config = JSON.parse(raw)
+    } catch {
+      return 0
+    }
+  }
+  if (!config || typeof config !== 'object') return 0
+  const anchor = (config as Record<string, unknown>)._usage_anchor
+  if (!anchor || typeof anchor !== 'object') return 0
+  const prompt = Number((anchor as Record<string, unknown>).prompt_tokens)
+  return Number.isFinite(prompt) && prompt > 0 ? Math.round(prompt) : 0
+}
+
+// hermes-jcmm: the window belongs to the SESSION's model, not the gateway's
+// default one. OpenRouter's public catalog carries context_length per id;
+// fetched once an hour, no key needed.
+const OPENROUTER_CATALOG_TTL_MS = 60 * 60 * 1000
+let openRouterCatalog: { at: number; windows: Map<string, number> } | null = null
+async function readOpenRouterContextWindow(model: string): Promise<number> {
+  const id = model.replace(/^openrouter\//i, '').trim().toLowerCase()
+  if (!id) return 0
+  const now = Date.now()
+  if (!openRouterCatalog || now - openRouterCatalog.at > OPENROUTER_CATALOG_TTL_MS) {
+    try {
+      const res = await fetch('https://openrouter.ai/api/v1/models', {
+        signal: AbortSignal.timeout(4000),
+      })
+      if (res.ok) {
+        const payload = (await res.json()) as {
+          data?: Array<{ id?: string; context_length?: number }>
+        }
+        const windows = new Map<string, number>()
+        for (const entry of payload.data ?? []) {
+          const entryId = typeof entry.id === 'string' ? entry.id.toLowerCase() : ''
+          const length = Number(entry.context_length) || 0
+          if (entryId && length > 0) windows.set(entryId, length)
+        }
+        openRouterCatalog = { at: now, windows }
+      }
+    } catch {
+      /* keep whatever we had */
+    }
+  }
+  return openRouterCatalog?.windows.get(id) ?? 0
+}
+
+async function resolveModelContextWindow(
+  model: string,
+  configured: ResolvedModelContext | null,
+): Promise<number> {
+  const bare = model.replace(/^openrouter\//i, '').trim()
+  const configuredBare = (configured?.model ?? '').replace(/^openrouter\//i, '').trim()
+  // Same model as the gateway default: the configured (managed) length wins,
+  // e.g. model.context_length: 1000000 pinned for Gemini.
+  if (configured?.maxTokens && (!bare || bare === configuredBare)) {
+    return configured.maxTokens
+  }
+  const fromCatalog = await readOpenRouterContextWindow(bare)
+  if (fromCatalog > 0) return fromCatalog
+  if (configured?.maxTokens && !MODEL_CONTEXT_WINDOWS[bare]) return configured.maxTokens
+  return getContextWindow(bare || model)
+}
+
 function getContextWindow(model: string): number {
   if (MODEL_CONTEXT_WINDOWS[model]) return MODEL_CONTEXT_WINDOWS[model]
   for (const [key, value] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
@@ -229,11 +305,28 @@ async function readConfiguredModelContext(): Promise<ResolvedModelContext | null
   }
 }
 
+// hermes-jcmm: `GET /api/sessions/{id}/runtime` does not exist on Hermes Agent
+// v0.21.3 (it is absent from the api_server route table), so every context
+// poll was spending a request on a guaranteed 404. Latch the endpoint off for
+// the life of the process once several calls in a row 404 with no success in
+// between — a single 404 only means "no such session", but a missing route
+// never answers. Logged once; a gateway upgrade needs a restart anyway.
+const RUNTIME_MISSING_STRIKES = 3
+let runtimeEndpointMissing = false
+let runtimeConsecutive404 = 0
+
+/** Test-only: clear the per-process 404 latch between cases. */
+export function resetRuntimeEndpointProbe(): void {
+  runtimeEndpointMissing = false
+  runtimeConsecutive404 = 0
+}
+
 async function readGatewayRuntimeSnapshot(
   sessionId: string,
 ): Promise<ContextUsageSnapshot | null> {
   const sid = sessionId.trim()
   if (!sid) return null
+  if (runtimeEndpointMissing) return null
   try {
     const res = await fetch(
       `${CLAUDE_API}/api/sessions/${encodeURIComponent(sid)}/runtime`,
@@ -242,6 +335,18 @@ async function readGatewayRuntimeSnapshot(
         signal: AbortSignal.timeout(2500),
       },
     )
+    if (res.status === 404) {
+      runtimeConsecutive404 += 1
+      if (runtimeConsecutive404 >= RUNTIME_MISSING_STRIKES) {
+        runtimeEndpointMissing = true
+        console.warn(
+          '[context-usage] Hermes gateway has no /api/sessions/{id}/runtime endpoint; ' +
+            'falling back to session totals for the rest of this process.',
+        )
+      }
+    } else {
+      runtimeConsecutive404 = 0
+    }
     if (!res.ok) return null
     const data = (await res.json()) as {
       model?: unknown
@@ -286,6 +391,11 @@ async function readGatewayRuntimeSnapshot(
 async function resolveRuntimeSessionId(sessionId: string): Promise<string> {
   const trimmed = sessionId.trim()
   if (trimmed !== 'main') return trimmed
+
+  // hermes-jcmm: when the gateway has a REAL session whose id is literally
+  // 'main', read that session — never the 'most recently titled chat' alias,
+  // which would report another conversation's model and context usage.
+  if (await hasRealMainSession()) return trimmed
 
   const capabilities = getCapabilities()
   if (
@@ -495,7 +605,8 @@ export async function readContextUsage(
     if (!sessionData) return configuredEmptySnapshot(configuredModelContext)
 
     const model = String(sessionData.model || '')
-    const maxTokens = configuredModelContext?.maxTokens || getContextWindow(model)
+    const maxTokens = await resolveModelContextWindow(model, configuredModelContext)
+    const anchorPromptTokens = readUsageAnchorPromptTokens(sessionData)
     const cacheReadTokens = Number(sessionData.cache_read_tokens) || 0
     const cacheWriteTokens = Number(sessionData.cache_write_tokens) || 0
     const inputTokens = Number(sessionData.input_tokens) || 0
@@ -505,7 +616,9 @@ export async function readContextUsage(
     let usedTokens = 0
     const assistantTurns = Math.max(1, Math.ceil(messageCount / 2))
 
-    if (apiCallCount > 0) {
+    if (anchorPromptTokens > 0) {
+      usedTokens = anchorPromptTokens
+    } else if (apiCallCount > 0) {
       usedTokens = estimateContextTokensFromSessionUsage(
         inputTokens,
         cacheReadTokens,

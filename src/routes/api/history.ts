@@ -5,16 +5,18 @@ import {
   ensureGatewayProbed,
   getGatewayCapabilities,
   getMessages,
+  getMessagesWithCompacted,
   listSessions,
   toChatMessage,
+  getSession,
 } from '../../server/claude-api'
 import {
   resolveMainChatSessionId,
   resolveSessionKey,
-  shouldBindMainToPortableSession,
-} from '../../server/session-utils'
+  shouldBindMainToPortableSession, hasRealMainSession } from '../../server/session-utils'
 import { isAuthenticated } from '@/server/auth-middleware'
 import { getLocalSession, getLocalMessages } from '../../server/local-session-store'
+import { readCompactionStats } from '../../server/lcm-stats'
 
 export const Route = createFileRoute('/api/history')({
   server: {
@@ -44,11 +46,14 @@ export const Route = createFileRoute('/api/history')({
             friendlyId,
             defaultKey: 'main',
           })
-          const pinPortableMain = shouldBindMainToPortableSession({
-            sessionKey,
-            dashboardAvailable: capabilities.dashboard.available,
-            enhancedChat: capabilities.enhancedChat,
-          })
+          const realMain = sessionKey === 'main' && (await hasRealMainSession())
+          const pinPortableMain =
+            !realMain &&
+            shouldBindMainToPortableSession({
+              sessionKey,
+              dashboardAvailable: capabilities.dashboard.available,
+              enhancedChat: capabilities.enhancedChat,
+            })
           // Keep /chat/new empty until the first message creates a real session.
           if (sessionKey === 'new') {
             return json({
@@ -65,7 +70,7 @@ export const Route = createFileRoute('/api/history')({
           //   2. The most recent non-internal session with messages.
           // Cron + Operations per-agent sessions are skipped so the
           // orchestrator chat doesn't latch onto runtime junk.
-          if (sessionKey === 'main' && !pinPortableMain) {
+          if (sessionKey === 'main' && !pinPortableMain && !realMain) {
             try {
               const sessions = await listSessions(30, 0)
               const candidate = resolveMainChatSessionId(sessions)
@@ -99,7 +104,9 @@ export const Route = createFileRoute('/api/history')({
           }
           let messages: Awaited<ReturnType<typeof getMessages>> = []
           try {
-            messages = await getMessages(sessionKey)
+            // hermes-jcmm: include compacted rows (capped) so a compacted
+            // chat still scrolls back; the summary row becomes a divider.
+            messages = await getMessagesWithCompacted(sessionKey)
           } catch {
             messages = []
           }
@@ -124,13 +131,39 @@ export const Route = createFileRoute('/api/history')({
           }
 
           const boundedMessages = limit > 0 ? messages.slice(-limit) : messages
+          const chatMessages = boundedMessages.map((message, index) =>
+            toChatMessage(message, { historyIndex: index }),
+          )
+          // hermes-jcmm: put numbers on each "context compacted here" divider.
+          // hermes-lcm: from lcm.db summary_nodes (messages, tokens, when).
+          // Stock compressor: count the compacted rows since the last marker.
+          let sinceLastMarker = 0
+          for (let i = 0; i < chatMessages.length; i++) {
+            const chat = chatMessages[i]
+            const raw = boundedMessages[i] as { compacted?: unknown }
+            if (chat.__compactionMarker !== true) {
+              if (Number(raw.compacted) === 1) sinceLastMarker += 1
+              continue
+            }
+            const node = typeof chat.__compactionNode === 'number' ? chat.__compactionNode : null
+            const markerAt = typeof chat.timestamp === 'number' ? chat.timestamp : null
+            const stats = await readCompactionStats(sessionKey, node, markerAt)
+            chat.__compaction = {
+              node,
+              messages: stats?.messages || sinceLastMarker,
+              sourceTokens: stats?.sourceTokens ?? 0,
+              summaryTokens: stats?.summaryTokens ?? 0,
+              compactedAt: stats?.createdAt ?? (chat.timestamp as number | undefined) ?? null,
+              earliestAt: stats?.earliestAt ?? null,
+              latestAt: stats?.latestAt ?? null,
+            }
+            sinceLastMarker = 0
+          }
 
           return json({
             sessionKey,
             sessionId: sessionKey,
-            messages: boundedMessages.map((message, index) =>
-              toChatMessage(message, { historyIndex: index }),
-            ),
+            messages: chatMessages,
           })
         } catch (err) {
           return json(

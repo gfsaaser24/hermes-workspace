@@ -16,7 +16,14 @@ import {
   setRunThinking,
   upsertRunToolCall,
 } from '../../server/run-store'
-import { getChatMode } from '../../server/gateway-capabilities'
+import {
+  RESUME_PUBLISHED_EVENTS,
+  getRunAbort,
+  publishRunEvent,
+  registerRunAbort,
+  unregisterRunAbort,
+} from '../../server/run-stream-bus'
+import { forceReprobeGateway, getChatMode } from '../../server/gateway-capabilities'
 import { appendLocalMessage, ensureLocalSession, getLocalMessages, touchLocalSession } from '../../server/local-session-store'
 import { getDiscoveredModels, getLocalProviderDef } from '../../server/local-provider-discovery'
 import { openaiChat } from '../../server/openai-compat-api'
@@ -28,17 +35,30 @@ import {
   ensureGatewayProbed,
   getGatewayCapabilities,
   getMessages as getSessionMessagesFromAgent,
+  getSession as getSessionFromAgent,
   listSessions,
+  lockSessionModel,
   streamChat,
 } from '../../server/claude-api'
 import { loadWorkspaceCatalog } from './workspace'
 import {
   collectSyntheticLiveToolEvents,
+  createRunMessageWindow,
   createSyntheticLiveToolTracker,
+  selectRunMessages,
 } from './-send-stream-live-tools'
 import type {OpenAICompatContentPart, OpenAICompatMessage} from '../../server/openai-compat-api';
 // Claude agent runs can take 5+ minutes with complex tool chains
-const SEND_STREAM_RUN_TIMEOUT_MS = 600_000
+// hermes-jcmm: the browser no longer bounds a run, so the server does.
+function sendStreamRunTimeoutMs(): number {
+  const raw = Number(process.env.HERMES_RUN_MAX_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 600_000
+}
+// If the agent says nothing at all for this long, abort the upstream fetch.
+function runIdleAbortMs(): number {
+  const raw = Number(process.env.HERMES_RUN_IDLE_ABORT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 900_000
+}
 const SESSION_BOOTSTRAP_KEYS = new Set(['main', 'new'])
 
 function readString(value: unknown): string {
@@ -48,6 +68,52 @@ function readString(value: unknown): string {
 function readNumber(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   return undefined
+}
+
+/** Flatten an agent message body (string, content-part array, or message
+ *  object) down to plain text. */
+function extractMessageText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => {
+        if (typeof part === 'string') return part
+        if (part && typeof part === 'object') {
+          const partText = (part as Record<string, unknown>).text
+          if (typeof partText === 'string') return partText
+        }
+        return ''
+      })
+      .join('')
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    if ('content' in obj) return extractMessageText(obj.content)
+    if (typeof obj.text === 'string') return obj.text
+  }
+  return ''
+}
+
+/**
+ * hermes-jcmm: the final assistant text carried by a `run.completed` payload.
+ *
+ * The agent puts the authoritative per-turn transcript on `run.completed`
+ * (`messages: [...]`); older/other builds only carry `content` or `message`.
+ * Returns '' when nothing non-blank is there.
+ */
+function readFinalAssistantText(data: Record<string, unknown>): string {
+  const messages = Array.isArray(data.messages) ? data.messages : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const entry = messages[i]
+    if (!entry || typeof entry !== 'object') continue
+    const message = entry as Record<string, unknown>
+    if (message.role !== 'assistant') continue
+    const text = extractMessageText(message.content)
+    if (text.trim()) return text
+  }
+  const direct =
+    extractMessageText(data.message) || extractMessageText(data.content)
+  return direct.trim() ? direct : ''
 }
 
 function stripDataUrlPrefix(value: string): string {
@@ -291,6 +357,26 @@ export const Route = createFileRoute('/api/send-stream')({
         const csrfCheck = requireJsonContentType(request)
         if (csrfCheck) return csrfCheck
         await ensureGatewayProbed()
+        // hermes-jcmm: right after a deploy the Workspace boots before the
+        // agent's API server listens, the first probe says "disconnected" and
+        // that answer is cached for 15s. A send inside that window skipped the
+        // portable path and hit /api/sessions/{id}/chat/stream for a session
+        // the agent had never seen (404, empty stream, run stuck 'accepted').
+        // Ask again with the real request in hand; refuse plainly if the agent
+        // is really down instead of guessing a transport.
+        if (getChatMode() === 'disconnected') {
+          await forceReprobeGateway()
+          if (getChatMode() === 'disconnected') {
+            return new Response(
+              JSON.stringify({
+                ok: false,
+                error:
+                  'Hermes gateway is not reachable yet — wait a few seconds and send again.',
+              }),
+              { status: 503, headers: { 'Content-Type': 'application/json' } },
+            )
+          }
+        }
 
         // Read body manually to handle large payloads (image attachments
         // can push the JSON body above the default ~1MB parse limit).
@@ -379,47 +465,71 @@ export const Route = createFileRoute('/api/send-stream')({
         // Create streaming response using the SHARED server connection
         const encoder = new TextEncoder()
         let streamClosed = false
+        // hermes-jcmm: the browser is only a SUBSCRIBER to this run. When it
+        // goes away (reload, tab switch, dropped SSE) we stop writing to the
+        // response but keep consuming the agent stream and keep persisting to
+        // run-store, so /api/runs/{session}/{run}/stream can replay + tail it.
+        let clientDetached = false
         let activeRunId: string | null = null
         let activeRunSessionKey: string | null = null
         let persistedRunReady: Promise<unknown> | null = null
         let unregisterTimer: ReturnType<typeof setTimeout> | null = null
-        let streamTimeoutTimer: ReturnType<typeof setTimeout> | null = null
+        let idleTimer: ReturnType<typeof setTimeout> | null = null
         let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+        let keepaliveTimer: ReturnType<typeof setInterval> | null = null
+        // Agent-side run id when the gateway reports one. Used only for the
+        // best-effort POST /v1/runs/{id}/stop and chat-event dedup.
+        let agentRunId: string | null = null
         const abortController = new AbortController()
         // Close out the SSE stream — stop enqueueing, clear timers, and
         // abort the upstream Hermes gateway request so the agent stops
         // processing.  Does NOT touch run status (persistActiveRun etc.).
         // The abort path (request.signal / handleAbort) owns run cleanup.
-        let closeStream = () => {
-          if (streamClosed) return
-          streamClosed = true
+        const clearRunTimers = () => {
           if (heartbeatTimer) {
             clearInterval(heartbeatTimer)
             heartbeatTimer = null
+          }
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer)
+            keepaliveTimer = null
           }
           if (unregisterTimer) {
             clearTimeout(unregisterTimer)
             unregisterTimer = null
           }
-          if (streamTimeoutTimer) {
-            clearTimeout(streamTimeoutTimer)
-            streamTimeoutTimer = null
+          if (idleTimer) {
+            clearTimeout(idleTimer)
+            idleTimer = null
           }
+        }
+        let closeStream = () => {
+          if (streamClosed) return
+          streamClosed = true
+          clearRunTimers()
           abortController.abort()
         }
 
-        // When the client hits Stop / navigates away / closes the tab, the
-        // request.signal fires abort.  Stop the upstream agent (closeStream)
-        // and clean up run tracking so we don't burn API credits on an orphan.
-        function handleAbort() {
-          if (activeRunId && !streamClosed) {
-            persistActiveRun((runSessionKey, activeId) =>
-              markRunStatus(runSessionKey, activeId, 'handoff'),
-            )
-            unregisterActiveSendRun(activeRunId)
-            activeRunId = null
+        // hermes-jcmm: detach the browser without touching the agent run.
+        // Previously this aborted the upstream Hermes fetch and flipped the
+        // run to 'handoff' — which is exactly why a reload during a long tool
+        // chain left the user with a dead spinner and a half-finished turn.
+        // Timers that only serve the browser are cleared; the SEND_STREAM run
+        // timeout still bounds the run.
+        let detachClient = () => {
+          if (clientDetached || streamClosed) return
+          clientDetached = true
+          if (heartbeatTimer) {
+            clearInterval(heartbeatTimer)
+            heartbeatTimer = null
           }
-          closeStream()
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer)
+            keepaliveTimer = null
+          }
+        }
+        function handleAbort() {
+          detachClient()
         }
         request.signal.addEventListener('abort', () => handleAbort(), { once: true })
 
@@ -450,7 +560,6 @@ export const Route = createFileRoute('/api/send-stream')({
 
         const stream = new ReadableStream({
           async start(controller) {
-            let heartbeatTimer: ReturnType<typeof setInterval> | null = null
             let lastClientEventAt = Date.now()
             // Track the last human-readable activity so the heartbeat can
             // forward it to the UI. Without this the ThinkingBubble shows a
@@ -458,11 +567,40 @@ export const Route = createFileRoute('/api/send-stream')({
             // without tool calls, making it look hung.
             let lastActivity: string | null = null
             const enqueueRaw = (payload: string) => {
-              if (streamClosed) return
-              controller.enqueue(encoder.encode(payload))
+              if (streamClosed || clientDetached) return
+              try {
+                controller.enqueue(encoder.encode(payload))
+              } catch {
+                // The browser went away between checks — keep the run going.
+                clientDetached = true
+              }
+            }
+            // hermes-jcmm: resumers need the ACCUMULATED assistant text. The
+            // browser gets raw deltas (assistant.delta), so normalise here —
+            // a late subscriber must never receive a lone fragment.
+            let resumeText = ''
+            const publishForResume = (
+              event: string,
+              data: Record<string, unknown>,
+            ) => {
+              if (!activeRunId) return
+              if (!RESUME_PUBLISHED_EVENTS.has(event)) return
+              if (event === 'chunk') {
+                const text = typeof data.text === 'string' ? data.text : ''
+                resumeText =
+                  data.fullReplace === true ? text : `${resumeText}${text}`
+                publishRunEvent(activeRunId, 'chunk', {
+                  ...data,
+                  text: resumeText,
+                  fullReplace: true,
+                })
+                return
+              }
+              publishRunEvent(activeRunId, event, data)
             }
             const sendEvent = (event: string, data: unknown) => {
-              if (streamClosed) return
+              publishForResume(event, (data ?? {}) as Record<string, unknown>)
+              if (streamClosed || clientDetached) return
               lastClientEventAt = Date.now()
               const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
               enqueueRaw(payload)
@@ -474,7 +612,9 @@ export const Route = createFileRoute('/api/send-stream')({
             // lightweight recognized event periodically so public Workspace chats
             // do not sit at "Thinking…" until the frontend reports failure.
             enqueueRaw(`: ${' '.repeat(2048)}\n\n`)
-            heartbeatTimer = setInterval(() => {
+            // hermes-jcmm: its own handle — this used to be overwritten by
+            // the heartbeat interval below and then leak for good.
+            keepaliveTimer = setInterval(() => {
               if (streamClosed) return
               if (Date.now() - lastClientEventAt < 10_000) return
               // Heartbeat to keep Cloudflare/Access from culling the SSE stream.
@@ -485,24 +625,36 @@ export const Route = createFileRoute('/api/send-stream')({
               enqueueRaw(': keepalive\n\n')
             }, 10_000)
 
-            closeStream = () => {
-              if (streamClosed) return
-              streamClosed = true
+            detachClient = () => {
+              if (clientDetached || streamClosed) return
+              clientDetached = true
               if (heartbeatTimer) {
                 clearInterval(heartbeatTimer)
                 heartbeatTimer = null
               }
-              if (unregisterTimer) {
-                clearTimeout(unregisterTimer)
-                unregisterTimer = null
+              if (keepaliveTimer) {
+                clearInterval(keepaliveTimer)
+                keepaliveTimer = null
               }
-              if (streamTimeoutTimer) {
-                clearTimeout(streamTimeoutTimer)
-                streamTimeoutTimer = null
+              try {
+                controller.close()
+              } catch {
+                // already torn down by the disconnect
               }
+            }
+
+            closeStream = () => {
+              if (streamClosed) return
+              streamClosed = true
+              clearRunTimers()
               if (activeRunId) {
                 unregisterActiveSendRun(activeRunId)
+                unregisterRunAbort(activeRunId)
                 activeRunId = null
+              }
+              if (agentRunId) {
+                unregisterActiveSendRun(agentRunId)
+                agentRunId = null
               }
               abortController.abort()
               try {
@@ -521,6 +673,39 @@ export const Route = createFileRoute('/api/send-stream')({
               sendEvent('heartbeat', { timestamp: Date.now(), activity: lastActivity })
             }, 10_000)
 
+            // hermes-jcmm: the browser is only a subscriber now, so these
+            // two are the ONLY hard bounds on a run. Both abort the upstream
+            // fetch, mark the run errored, and tell every resumer to stop.
+            const failRun = (reason: 'timeout' | 'idle', message: string) => {
+              if (streamClosed) return
+              persistActiveRun((runSessionKey, activeId) =>
+                markRunStatus(runSessionKey, activeId, 'error', message),
+              )
+              sendEvent('done', {
+                state: 'error',
+                reason,
+                errorMessage: message,
+                sessionKey: activeRunSessionKey ?? sessionKey,
+                runId: activeRunId ?? undefined,
+              })
+              closeStream()
+            }
+            const armRunTimeout = () => {
+              if (unregisterTimer) clearTimeout(unregisterTimer)
+              unregisterTimer = setTimeout(() => {
+                failRun('timeout', 'Run exceeded the maximum duration')
+              }, sendStreamRunTimeoutMs())
+            }
+            // Reset on every byte from the agent. Silence for this long
+            // means the upstream is wedged — nothing else would notice.
+            const touchUpstream = () => {
+              if (streamClosed) return
+              if (idleTimer) clearTimeout(idleTimer)
+              idleTimer = setTimeout(() => {
+                failRun('idle', 'Agent stopped responding')
+              }, runIdleAbortMs())
+            }
+
             try {
               if (chatMode === 'portable') {
                 const runId = crypto.randomUUID()
@@ -534,16 +719,36 @@ export const Route = createFileRoute('/api/send-stream')({
                   rawSessionKey ||
                   portableSessionKey
                 let accumulated = ''
+                // hermes-jcmm: the turn's LAST assistant segment — the text
+                // streamed since the most recent tool event. v0.21.3 keeps
+                // its own per-message transcript ("one" row, "two" row, …,
+                // "DONE" row) and /api/history reads that agent transcript
+                // before the local fallback store, so a `done` message
+                // carrying the whole turn shows twice: once as the realtime
+                // bubble and once as the "DONE" transcript row (the
+                // chat-store dedupes by exact text, which cannot match).
+                // `accumulated` still drives the live chunks and the local
+                // fallback row; only the answer we finish on is the segment.
+                let currentSegment = ''
+                const beginPortableSegment = () => {
+                  currentSegment = ''
+                }
+                // Never finish on nothing: a turn whose last event was a tool
+                // call falls back to everything we saw.
+                const finalPortableText = () =>
+                  currentSegment.trim() ? currentSegment : accumulated
 
                 activeRunId = runId
                 registerActiveSendRun(runId)
+                // hermes-jcmm: an explicit Stop (POST .../abandon) needs a
+                // handle on the upstream fetch — client disconnect no longer
+                // aborts it. Portable runs have no agent-side run id.
+                registerRunAbort(runId, {
+                  abort: () => abortController.abort(),
+                })
                 persistRunStarted(runId, portableSessionKey, portableFriendlyId)
-                unregisterTimer = setTimeout(() => {
-                  if (activeRunId) {
-                    unregisterActiveSendRun(activeRunId)
-                    activeRunId = null
-                  }
-                }, SEND_STREAM_RUN_TIMEOUT_MS)
+                armRunTimeout()
+                touchUpstream()
 
                 sendEvent('started', {
                   runId,
@@ -627,8 +832,10 @@ export const Route = createFileRoute('/api/send-stream')({
                         signal: abortController.signal,
                       })
                       for await (const ev of responsesStream) {
+                        touchUpstream()
                         if (ev.kind === 'text.delta') {
                           accumulated += ev.delta
+                          currentSegment += ev.delta
                           persistActiveRun((runSessionKey, activeId) =>
                             appendRunText(
                               runSessionKey,
@@ -646,6 +853,9 @@ export const Route = createFileRoute('/api/send-stream')({
                           continue
                         }
                         if (ev.kind === 'tool.started') {
+                          // Segment boundary: the text before this call
+                          // belongs to the message that made it.
+                          beginPortableSegment()
                           toolStateByCallId.set(ev.callId, {
                             name: ev.name,
                             args: ev.args,
@@ -684,6 +894,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           continue
                         }
                         if (ev.kind === 'tool.output') {
+                          beginPortableSegment()
                           const state = toolStateByCallId.get(ev.callId)
                           const argsForCard =
                             state?.args && typeof state.args === 'object'
@@ -720,6 +931,8 @@ export const Route = createFileRoute('/api/send-stream')({
                           throw new Error(ev.error)
                         }
                       }
+                      // The local store stays whole-turn: it is only the
+                      // fallback history for boxes with no agent transcript.
                       appendLocalMessage(portableSessionKey, {
                         id: crypto.randomUUID(),
                         role: 'assistant',
@@ -727,9 +940,27 @@ export const Route = createFileRoute('/api/send-stream')({
                         timestamp: Date.now(),
                       })
                       touchLocalSession(portableSessionKey)
+                      const responsesFinalText = finalPortableText()
+                      persistActiveRun((runSessionKey, activeId) =>
+                        appendRunText(
+                          runSessionKey,
+                          activeId,
+                          responsesFinalText,
+                          { replace: true },
+                        ),
+                      )
                       persistActiveRun((runSessionKey, activeId) =>
                         markRunStatus(runSessionKey, activeId, 'complete'),
                       )
+                      // hermes-jcmm: the browser's live buffer still holds the
+                      // whole turn from the mid-run fullReplace chunks; hand it
+                      // the last segment so the placeholder matches the row.
+                      sendEvent('chunk', {
+                        text: responsesFinalText,
+                        fullReplace: true,
+                        sessionKey: portableSessionKey,
+                        runId,
+                      })
                       sendEvent('done', {
                         state: 'complete',
                         sessionKey: portableSessionKey,
@@ -738,7 +969,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           role: 'assistant',
                           content: [
                             ...(thinking ? [{ type: 'thinking', thinking }] : []),
-                            { type: 'text', text: accumulated },
+                            { type: 'text', text: responsesFinalText },
                           ],
                         },
                       })
@@ -754,6 +985,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       )
                       // Reset accumulated so the fallback starts clean.
                       accumulated = ''
+                      beginPortableSegment()
                     }
                   }
 
@@ -772,6 +1004,7 @@ export const Route = createFileRoute('/api/send-stream')({
                   let thinking = ''
                   let toolEventCount = 0
                   for await (const chunk of stream) {
+                    touchUpstream()
                     if (chunk.type === 'reasoning') {
                       thinking += chunk.text
                       persistActiveRun((runSessionKey, activeId) =>
@@ -783,6 +1016,9 @@ export const Route = createFileRoute('/api/send-stream')({
                         runId,
                       })
                     } else if (chunk.type === 'tool') {
+                      // Segment boundary — the agent may talk again after
+                      // this call, and that reply is the one to finish on.
+                      beginPortableSegment()
                       // Prefer the gateway's stable tool_call_id so 'running'
                       // and 'completed' events for the same call collapse to
                       // one card row. Fall back to a synthetic id only when
@@ -819,6 +1055,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       })
                     } else {
                       accumulated += chunk.text
+                      currentSegment += chunk.text
                       persistActiveRun((runSessionKey, activeId) =>
                         appendRunText(runSessionKey, activeId, accumulated, {
                           replace: true,
@@ -833,7 +1070,9 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
                   }
 
-                  // Persist assistant response to local session store
+                  // Persist assistant response to local session store.
+                  // Whole-turn on purpose: this row is only the fallback
+                  // history for boxes whose agent keeps no transcript.
                   appendLocalMessage(portableSessionKey, {
                     id: crypto.randomUUID(),
                     role: 'assistant',
@@ -842,9 +1081,27 @@ export const Route = createFileRoute('/api/send-stream')({
                   })
                   touchLocalSession(portableSessionKey)
 
+                  // hermes-jcmm: finish on the last segment, not the whole
+                  // turn — the mid-run chunks above kept the live bubble
+                  // continuous, this is the answer the client keeps.
+                  const portableFinalText = finalPortableText()
+                  persistActiveRun((runSessionKey, activeId) =>
+                    appendRunText(runSessionKey, activeId, portableFinalText, {
+                      replace: true,
+                    }),
+                  )
                   persistActiveRun((runSessionKey, activeId) =>
                     markRunStatus(runSessionKey, activeId, 'complete'),
                   )
+                  // hermes-jcmm: same as above — the client's live buffer must
+                  // end on the last segment, or the finished placeholder never
+                  // matches the transcript row and the answer shows twice.
+                  sendEvent('chunk', {
+                    text: portableFinalText,
+                    fullReplace: true,
+                    sessionKey: portableSessionKey,
+                    runId,
+                  })
                   sendEvent('done', {
                     state: 'complete',
                     sessionKey: portableSessionKey,
@@ -853,7 +1110,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       role: 'assistant',
                       content: [
                         ...(thinking ? [{ type: 'thinking', thinking }] : []),
-                        { type: 'text', text: accumulated },
+                        { type: 'text', text: portableFinalText },
                       ],
                     },
                   })
@@ -886,6 +1143,17 @@ export const Route = createFileRoute('/api/send-stream')({
                 // chat doesn't latch onto them.
                 let reused: string | null = null
                 if (sessionKey === 'main') {
+                  // hermes-jcmm: if the gateway has a real session whose id is
+                  // literally 'main', use it — never re-route the user's
+                  // message into "whatever chat was most recently active".
+                  try {
+                    const real = await getSessionFromAgent('main')
+                    if (real && real.id === 'main') reused = 'main'
+                  } catch {
+                    // no real 'main' session; fall through to the legacy alias
+                  }
+                }
+                if (sessionKey === 'main' && !reused) {
                   try {
                     const recent = await listSessions(30, 0)
                     const isInternal = (id: string) =>
@@ -932,30 +1200,61 @@ export const Route = createFileRoute('/api/send-stream')({
               // useRealtimeChatHistory from creating duplicate message bubbles.
               const skipPublish = true
 
-              // Mid-run tool polling: vanilla Hermes Agent currently does not
-              // emit tool.* SSE events live (callback signature drift). Until
-              // upstream fixes that, we synthesize live tool events by polling
-              // the agent's session messages every ~1.5s during the run and
-              // emitting any new tool calls as event: tool with phase complete
-              // as soon as their tool_result message lands. The Workspace
-              // chat-store dedupes by tool_call_id so this is safe alongside
-              // any real live events that might arrive.
+              // hermes-jcmm: a turn can hold SEVERAL assistant messages —
+              // the agent talks ("one"), runs a tool, talks again ("two"),
+              // ... and finishes with "DONE". Every assistant.delta lands on
+              // one message_id, and v0.21.3 closes the turn with a single
+              // assistant.completed whose `content` is the whole turn glued
+              // together (gateway/platforms/api_server.py `_run_and_signal`).
+              // Accumulating all of that into the answer left the browser
+              // with a realtime bubble holding every intermediate reply while
+              // the transcript held only "DONE" — the chat-store dedupes the
+              // `done` message against history by exact text, so both showed
+              // until a reload. Track the CURRENT assistant message on its
+              // own: reset on a tool boundary and on the first delta after a
+              // message was closed.
+              let currentAssistantText = ''
+              let assistantMessageClosed = false
+              const beginAssistantMessage = () => {
+                currentAssistantText = ''
+                assistantMessageClosed = false
+              }
+              // The agent's thinking deltas replace (see setRunThinking), so
+              // the latest one is the whole reasoning block. Kept so the
+              // `done` message can carry it the way the portable path does.
+              let lastThinkingText = ''
+
+              // hermes-jcmm: Hermes Agent v0.21.3 DOES emit tool.* SSE events
+              // live (gateway/platforms/api_server.py `_tool_progress` enqueues
+              // tool.started / tool.completed / tool.failed), so this poller is
+              // only a FALLBACK for older agents. It stops itself the moment a
+              // real tool.* event arrives (see stopLiveToolPoller below) so we
+              // don't re-read the whole transcript every 800ms for nothing.
+              // Until then it synthesizes live tool events by polling the
+              // agent's session messages and emitting new tool calls as
+              // event: tool. The Workspace chat-store dedupes by tool_call_id
+              // so this is safe alongside the real live events.
               const syntheticLiveToolTracker = createSyntheticLiveToolTracker()
               let liveRunActive = true
               const livePollIntervalMs = 800
-              // Snapshot the session message count at run-start so the poller
-              // and the post-run backfill only consider messages persisted by
-              // THIS run. Without this, "the most recent assistant with
-              // tool_calls" can resolve to the previous turn, surfacing stale
-              // tool cards (off-by-one-turn bug).
-              let liveBaselineCount = 0
+              // Snapshot the session transcript at run-start so the poller and
+              // the post-run backfill only consider messages persisted by THIS
+              // run. Without this, "the most recent assistant with tool_calls"
+              // can resolve to the previous turn, surfacing stale tool cards
+              // (off-by-one-turn bug).
+              let liveRunWindow = createRunMessageWindow(null)
               try {
                 const baseline = (await getSessionMessagesFromAgent(
                   sessionKey,
                 )) as unknown as Array<Record<string, unknown>>
-                if (Array.isArray(baseline)) liveBaselineCount = baseline.length
+                liveRunWindow = createRunMessageWindow(baseline)
               } catch {
-                liveBaselineCount = 0
+                liveRunWindow = createRunMessageWindow(null)
+              }
+              // hermes-jcmm: the agent's own tool.* events win; once one lands
+              // the fallback poller is redundant and only adds load.
+              const stopLiveToolPoller = () => {
+                liveRunActive = false
               }
               const livePollerPromise = (async () => {
                 // Initial small delay so the agent has time to ingest the
@@ -974,7 +1273,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       continue
                     }
                     // Only inspect messages added on or after this run started.
-                    const msgs = allMsgs.slice(liveBaselineCount)
+                    const msgs = selectRunMessages(liveRunWindow, allMsgs)
                     if (msgs.length === 0) {
                       await new Promise((r) =>
                         setTimeout(r, livePollIntervalMs),
@@ -1005,7 +1304,25 @@ export const Route = createFileRoute('/api/send-stream')({
                 }
               })()
 
+              // hermes-jcmm: the gateway may never emit a run_id (older
+              // builds, or a failure before the first event). Own a local
+              // run id from the start so Stop has a handle, the run is
+              // persisted, and a resumer has something to attach to.
+              const localRunId = crypto.randomUUID()
+              activeRunId = localRunId
+              registerActiveSendRun(localRunId)
+              registerRunAbort(localRunId, {
+                abort: () => abortController.abort(),
+              })
+              persistRunStarted(localRunId, sessionKey, resolvedFriendlyId)
+              armRunTimeout()
+              touchUpstream()
+
               try {
+                // hermes-jcmm: make the picked model stateful on the agent side.
+                if (typeof body.model === 'string' && body.model.trim() && !localBaseUrl) {
+                  await lockSessionModel(sessionKey, body.model)
+                }
                 await streamChat(
                 sessionKey,
                 {
@@ -1023,26 +1340,22 @@ export const Route = createFileRoute('/api/send-stream')({
                       data.session_id.trim()
                         ? data.session_id
                         : sessionKey
-                    const runId =
+                    touchUpstream()
+                    // hermes-jcmm: the Workspace run id (localRunId) is the
+                    // stable identity for run-store, the bus and the client.
+                    // The agent's own run_id is metadata: it feeds the
+                    // chat-events dedup and POST /v1/runs/{id}/stop.
+                    const eventRunId =
                       typeof data.run_id === 'string' && data.run_id.trim()
-                        ? data.run_id
-                        : (activeRunId ?? undefined)
-
-                    if (runId && !activeRunId) {
-                      activeRunId = runId
-                      registerActiveSendRun(runId)
-                      persistRunStarted(
-                        runId,
-                        sessionKeyFromEvent,
-                        sessionKeyFromEvent,
-                      )
-                      unregisterTimer = setTimeout(() => {
-                        if (activeRunId) {
-                          unregisterActiveSendRun(activeRunId)
-                          activeRunId = null
-                        }
-                      }, SEND_STREAM_RUN_TIMEOUT_MS)
+                        ? data.run_id.trim()
+                        : ''
+                    if (eventRunId && eventRunId !== agentRunId) {
+                      agentRunId = eventRunId
+                      registerActiveSendRun(eventRunId)
+                      const handle = getRunAbort(localRunId)
+                      if (handle) handle.agentRunId = eventRunId
                     }
+                    const runId = activeRunId ?? localRunId
 
                     if (!startedSent && runId) {
                       startedSent = true
@@ -1106,9 +1419,26 @@ export const Route = createFileRoute('/api/send-stream')({
                     if (event === 'assistant.completed') {
                       // Send full content as a chunk — covers cases where
                       // deltas were missed or response was too short for streaming
-                      const content =
+                      const payloadContent =
                         typeof data.content === 'string' ? data.content : ''
-                      if (content) {
+                      // hermes-jcmm: `content` is the WHOLE turn on v0.21.3,
+                      // intermediate replies included. When deltas streamed
+                      // we already know the last assistant message's own text
+                      // — use it so the full replace repaints just that
+                      // message. Fall back to the payload when nothing
+                      // streamed (short answers, missed deltas).
+                      // A blank payload stays blank — it is skipped below,
+                      // the same as before.
+                      const content =
+                        payloadContent.trim() && currentAssistantText.trim()
+                          ? currentAssistantText
+                          : payloadContent
+                      assistantMessageClosed = true
+                      // hermes-jcmm: whitespace-only counts as empty. This is
+                      // a full replace — letting '   ' through wiped both the
+                      // persisted run text and the text already on screen.
+                      if (content.trim()) {
+                        currentAssistantText = content
                         persistActiveRun((runSessionKey, activeId) =>
                           appendRunText(runSessionKey, activeId, content, {
                             replace: true,
@@ -1130,6 +1460,9 @@ export const Route = createFileRoute('/api/send-stream')({
                       const delta =
                         typeof data.delta === 'string' ? data.delta : ''
                       if (!delta) return
+                      // A delta after a closed message starts the next one.
+                      if (assistantMessageClosed) beginAssistantMessage()
+                      currentAssistantText += delta
                       persistActiveRun((runSessionKey, activeId) =>
                         appendRunText(runSessionKey, activeId, delta),
                       )
@@ -1149,6 +1482,9 @@ export const Route = createFileRoute('/api/send-stream')({
                       event === 'tool.calling' ||
                       event === 'tool.running'
                     ) {
+                      // A tool call ends the assistant message that asked
+                      // for it; whatever it said belongs to that message.
+                      beginAssistantMessage()
                       const toolName = getToolName(data)
                       const preview =
                         typeof data.preview === 'string'
@@ -1175,6 +1511,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           preview,
                         }),
                       )
+                      stopLiveToolPoller()
                       sendEvent('tool', translated)
                       skipPublish || publishChatEvent('tool', translated)
                       lastActivity = `Running: ${toolName.replace(/_/g, ' ')}`
@@ -1186,6 +1523,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const toolName = getToolName(data)
                       if (toolName === '_thinking' || toolName === 'tool') {
                         if (!delta) return
+                        lastThinkingText = delta
                         persistActiveRun((runSessionKey, activeId) =>
                           setRunThinking(runSessionKey, activeId, delta),
                         )
@@ -1223,6 +1561,7 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'tool.completed') {
+                      beginAssistantMessage()
                       const toolName = getToolName(data)
                       const resultPreview = getToolResultPreview(data)
                       const translated = {
@@ -1243,6 +1582,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           result: translated.result,
                         }),
                       )
+                      stopLiveToolPoller()
                       sendEvent('tool', translated)
                       skipPublish || publishChatEvent('tool', translated)
                       lastActivity = `Completed: ${toolName.replace(/_/g, ' ')}`
@@ -1328,6 +1668,7 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'tool.failed') {
+                      beginAssistantMessage()
                       const errorMessage =
                         readString(
                           (data.error as Record<string, unknown> | undefined)
@@ -1350,6 +1691,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           result: translated.result,
                         }),
                       )
+                      stopLiveToolPoller()
                       sendEvent('tool', translated)
                       skipPublish || publishChatEvent('tool', translated)
                       return
@@ -1381,6 +1723,10 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'run.completed') {
+                      // hermes-jcmm: last resort for the final answer text —
+                      // filled from the session transcript below when the
+                      // run.completed payload itself carries no text.
+                      let transcriptFinalText = ''
                       // Backfill tool calls from session history.
                       // Hermes Agent currently does not stream tool.* events
                       // reliably, but it persists tool calls on the assistant
@@ -1410,16 +1756,19 @@ export const Route = createFileRoute('/api/send-stream')({
                           // follow it so we can pair input/output.
                           // Use the per-run baseline so we never read tool
                           // calls from a previous turn.
-                          const sliceFrom = Math.max(
-                            0,
-                            Math.min(
-                              liveBaselineCount,
-                              Math.max(0, persistedMessages.length - 1),
-                            ),
+                          const recent = selectRunMessages(
+                            liveRunWindow,
+                            persistedMessages,
                           )
-                          const recent = persistedMessages.slice(
-                            sliceFrom,
-                          )
+                          for (let i = recent.length - 1; i >= 0; i--) {
+                            const m = recent[i]
+                            if (!m || m.role !== 'assistant') continue
+                            const text = extractMessageText(m.content)
+                            if (text.trim()) {
+                              transcriptFinalText = text
+                              break
+                            }
+                          }
                           let lastAssistantIndex = -1
                           for (let i = recent.length - 1; i >= 0; i--) {
                             const m = recent[i]
@@ -1476,10 +1825,59 @@ export const Route = createFileRoute('/api/send-stream')({
                         )
                       }
 
+                      // hermes-jcmm: the answer a turn ends on is its LAST
+                      // assistant message. run.completed carries the
+                      // authoritative per-turn transcript exactly so clients
+                      // that accumulated assistant.delta into one buffer can
+                      // reconcile against ground truth, so prefer it; then
+                      // the session transcript; then the text we tracked for
+                      // the current (last) assistant message.
+                      //
+                      // This also covers the older bug it replaces: a run
+                      // could finish with assistantText: '' when no
+                      // assistant.delta arrived and assistant.completed
+                      // carried blank `content`, leaving a finished run with
+                      // a blank reply in history.
+                      //
+                      // Queued BEFORE markRunStatus: both writes go through the
+                      // run-store queue for this run, so they stay ordered.
+                      const finalText =
+                        readFinalAssistantText(data) ||
+                        transcriptFinalText ||
+                        currentAssistantText
+                      if (finalText.trim()) {
+                        persistActiveRun((runSessionKey, activeId) =>
+                          appendRunText(runSessionKey, activeId, finalText, {
+                            replace: true,
+                          }),
+                        )
+                      }
                       const translated = {
                         state: 'complete',
                         sessionKey: sessionKeyFromEvent,
                         runId,
+                        // The authoritative final message, so the chat-store
+                        // stops rebuilding it from its own delta buffer (which
+                        // holds the whole turn) and its exact-text dedupe
+                        // against the transcript row lands.
+                        ...(finalText.trim()
+                          ? {
+                              message: {
+                                role: 'assistant',
+                                content: [
+                                  ...(lastThinkingText
+                                    ? [
+                                        {
+                                          type: 'thinking',
+                                          thinking: lastThinkingText,
+                                        },
+                                      ]
+                                    : []),
+                                  { type: 'text', text: finalText },
+                                ],
+                              },
+                            }
+                          : {}),
                       }
                       persistActiveRun((runSessionKey, activeId) =>
                         markRunStatus(runSessionKey, activeId, 'complete'),
@@ -1501,13 +1899,12 @@ export const Route = createFileRoute('/api/send-stream')({
                 }
               }
 
-              // Set a timeout to close the stream if no completion event
-              streamTimeoutTimer = setTimeout(() => {
-                if (!streamClosed) {
-                  sendEvent('error', { message: 'Stream timeout' })
-                  closeStream()
-                }
-              }, SEND_STREAM_RUN_TIMEOUT_MS)
+              // hermes-jcmm: the upstream stream ended without run.completed.
+              // This used to arm a 600s timer that could not bound anything
+              // (the read was already over) and kept the handler alive.
+              if (!streamClosed) {
+                failRun('idle', 'Agent closed the stream before completing')
+              }
             } catch (err) {
               // Only send error if stream hasn't already completed successfully
               if (!streamClosed) {
@@ -1521,17 +1918,12 @@ export const Route = createFileRoute('/api/send-stream')({
             }
           },
           cancel() {
-            // User clicked Stop, navigated away, or browser closed the tab.
-            // Mark the stream complete, persist the run as 'handoff' so
-            // session history reflects the interruption, then delegate to
-            // closeStream() for timer/controller cleanup.  Delegate instead
-            // of duplicating cleanup logic to keep the two paths in sync.
-            if (activeRunId && !streamClosed) {
-              persistActiveRun((runSessionKey, activeId) =>
-                markRunStatus(runSessionKey, activeId, 'handoff'),
-              )
-            }
-            closeStream()
+            // hermes-jcmm: the browser reader went away (reload, tab switch,
+            // navigation, proxy hiccup). Detach it only — the agent run keeps
+            // going, keeps persisting to run-store, and keeps publishing to
+            // the run bus so the resume stream can pick it up. Use
+            // /api/runs/{session}/{run}/abandon to actually kill a run.
+            detachClient()
           },
         })
 

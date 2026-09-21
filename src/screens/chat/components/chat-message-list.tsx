@@ -407,6 +407,9 @@ const NEAR_BOTTOM_THRESHOLD = 200
 
 const HIDDEN_SYSTEM_USER_PREFIXES = [
   'Pre-compaction memory flush',
+  // hermes-jcmm: hermes-lcm rewrites compacted history into a summary row
+  // with role 'user'. It is context, not something the user typed.
+  '[CONTEXT COMPACTION',
   'Read HEARTBEAT.md',
   'HEARTBEAT_OK',
   'Execute your Session Startup sequence',
@@ -765,6 +768,8 @@ function ChatMessageListComponent({
       }
 
       if (msg.role === 'user') {
+        // hermes-jcmm: compaction marker row — always visible, as a divider.
+        if ((msg as any).__compactionMarker === true) return true
         const rawText = (Array.isArray(msg.content) ? msg.content : [])
           .map((part) => (part.type === 'text' ? String(part.text ?? '') : ''))
           .join('')
@@ -1115,6 +1120,18 @@ function ChatMessageListComponent({
     .filter(({ message }) => message.role === 'user')
     .map(({ index }) => index)
     .pop()
+  // hermes-jcmm: sourceIndex of the last user message. The "last assistant is
+  // the streaming one" fallback below must not pick the PREVIOUS turn's reply
+  // in the moment between a send and its placeholder appearing — that bubble
+  // then rendered the new run's live tool calls on top of its own.
+  const lastUserSourceIndex = visibleEntries
+    .filter(({ message }) => message.role === 'user')
+    .map(({ sourceIndex }) => sourceIndex)
+    .pop()
+  const lastAssistantIsCurrentTurn =
+    typeof lastAssistantIndex === 'number' &&
+    (typeof lastUserSourceIndex !== 'number' ||
+      lastAssistantIndex > lastUserSourceIndex)
   // Show typing indicator when waiting for response and no visible text yet.
   // Bug 2 fix: also show during grace period (thinkingGrace) so there's no
   // blank-space flash between waitingForResponse clearing and the response
@@ -1311,13 +1328,64 @@ function ChatMessageListComponent({
     const messageId = message.__optimisticId || (message as any).id
     return (
       messageId === streamingMessageId ||
-      (message.role === 'assistant' && index === lastAssistantIndex)
+      (message.role === 'assistant' &&
+        lastAssistantIsCurrentTurn &&
+        index === lastAssistantIndex)
     )
   }
 
   function renderMessage(entry: DisplayEntry, entryIndex: number) {
     const chatMessage = entry.message
     const realIndex = entry.sourceIndex
+    // hermes-jcmm: where a compaction folded older messages into a summary.
+    // The rows above it are the compacted history (still loaded, capped);
+    // the agent's live context starts below it.
+    if ((chatMessage as any).__compactionMarker === true) {
+      const stats = (chatMessage as any).__compaction as
+        | {
+            messages?: number
+            sourceTokens?: number
+            summaryTokens?: number
+            compactedAt?: number | null
+          }
+        | undefined
+      const fmtInt = (n: number) => n.toLocaleString('en-US')
+      const parts: Array<string> = []
+      if (stats?.messages) parts.push(`${fmtInt(stats.messages)} messages`)
+      if (stats?.sourceTokens) {
+        parts.push(
+          stats.summaryTokens
+            ? `${fmtInt(stats.sourceTokens)} → ${fmtInt(stats.summaryTokens)} tokens`
+            : `${fmtInt(stats.sourceTokens)} tokens`,
+        )
+      }
+      if (stats?.compactedAt) {
+        parts.push(
+          new Date(stats.compactedAt).toLocaleString(undefined, {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+          }),
+        )
+      }
+      const detail = parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
+      return (
+        <div
+          key={getStableMessageId(chatMessage, realIndex)}
+          className="my-6 flex items-center gap-3 px-4 text-[11px] uppercase tracking-wide text-primary-500"
+          role="separator"
+          aria-label="Context compacted here"
+          data-chat-message-id={(chatMessage as any).id}
+        >
+          <div className="h-px flex-1 border-t border-dashed border-primary-300" />
+          <span className="whitespace-nowrap" title="Older messages above were folded into a summary for the agent">
+            Context compacted here{detail}
+          </span>
+          <div className="h-px flex-1 border-t border-dashed border-primary-300" />
+        </div>
+      )
+    }
     const messageIsStreaming = isMessageStreaming(chatMessage, realIndex)
     const stableId = getStableMessageId(chatMessage, realIndex)
     const signature = streamingState.signatureById.get(stableId)
@@ -1932,8 +2000,11 @@ function ChatMessageListComponent({
                   forceSimple={!showActivityFeed}
                 />
                 {/* After 10s of thinking, show activity feed. With tool calls:
-                    compact CLI-style TuiActivityCard (last 3). Without tool calls:
-                    a minimal status line showing elapsed time and heartbeat. */}
+                    CLI-style TuiActivityCard listing EVERY tool call of the run
+                    (hermes-jcmm: this used to be capped at the last 3, which hid
+                    long tool chains — the card header summarises "N running ·
+                    M done"). Without tool calls: a minimal status line showing
+                    elapsed time and heartbeat. */}
                 {showActivityFeed ? (
                   <div className="flex max-w-[var(--chat-content-max-width)]">
                     <div
@@ -1947,7 +2018,7 @@ function ChatMessageListComponent({
                     <div className="min-w-0 flex-1 pt-1">
                       {normalizedStreamingToolCalls.length > 0 ? (
                         <TuiActivityCard
-                          toolSections={normalizedStreamingToolCalls.slice(-3).map((tc) => {
+                          toolSections={normalizedStreamingToolCalls.map((tc) => {
                             const phase = tc.phase
                             const state =
                               phase === 'error'

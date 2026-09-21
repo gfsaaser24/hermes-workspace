@@ -9,6 +9,7 @@ import {
 import { MessageActionsBar } from './message-actions-bar'
 import {
   buildHermesActivitySummary,
+  mergeToolSectionsById,
   shouldAutoExpandHermesActivityCard,
 } from './streaming-activity-ui'
 import { TuiActivityCard } from './tui-activity-card'
@@ -2399,11 +2400,15 @@ function MessageItemComponent({
             toolMessage.toolName.trim()) ||
           parseToolNameFromMessageText(messageText)
         return {
+          // hermes-jcmm: tool-call id first so the section dedupes against
+          // the same call streamed live / embedded in __streamToolCalls
+          // (an attached assistant row carries it in its toolCall block).
           key:
-            (typeof (toolMessage as any).id === 'string' &&
-              (toolMessage as any).id) ||
             (typeof toolMessage.toolCallId === 'string' &&
               toolMessage.toolCallId) ||
+            getToolCallsFromMessage(toolMessage)[0]?.id ||
+            (typeof (toolMessage as any).id === 'string' &&
+              (toolMessage as any).id) ||
             `${toolType}-${index}`,
           type: toolType,
           input: readToolArgs(toolMessage.details),
@@ -2447,28 +2452,29 @@ function MessageItemComponent({
   )
   const inlineToolSections = useMemo<Array<InlineToolSection>>(
     () => [
-      ...streamToolSections,
-      ...toolParts.map((toolPart, index) => {
-        const rawOutput = toolPart.output
-        let outputText = ''
-        if (rawOutput) {
-          if (typeof rawOutput.output === 'string') {
-            outputText = rawOutput.output
-          } else {
-            outputText = JSON.stringify(rawOutput, null, 2)
+      ...mergeToolSectionsById(
+        mergeToolSectionsById(streamToolSections, attachedToolSections),
+        toolParts.map((toolPart, index) => {
+          const rawOutput = toolPart.output
+          let outputText = ''
+          if (rawOutput) {
+            if (typeof rawOutput.output === 'string') {
+              outputText = rawOutput.output
+            } else {
+              outputText = JSON.stringify(rawOutput, null, 2)
+            }
           }
-        }
 
-        return {
-          key: toolPart.toolCallId || `${toolPart.type}-${index}`,
-          type: toolPart.type,
-          input: toolPart.input,
-          outputText,
-          errorText: toolPart.errorText,
-          state: toolPart.state,
-        }
-      }),
-      ...attachedToolSections,
+          return {
+            key: toolPart.toolCallId || `${toolPart.type}-${index}`,
+            type: toolPart.type,
+            input: toolPart.input,
+            outputText,
+            errorText: toolPart.errorText,
+            state: toolPart.state,
+          }
+        }),
+      ),
     ],
     [attachedToolSections, streamToolSections, toolParts],
   )

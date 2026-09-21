@@ -195,6 +195,16 @@ function FilesRoute() {
     }
   }, [])
 
+  // Close the editor when the open file (or a folder containing it) is gone.
+  const handleDeleted = useCallback((deletedPath: string) => {
+    const gone = deletedPath.replace(/\\/g, '/')
+    setLoaded((prev) => {
+      if (!prev) return prev
+      const open = prev.path.replace(/\\/g, '/')
+      return open === gone || open.startsWith(`${gone}/`) ? null : prev
+    })
+  }, [])
+
   const handleDownload = useCallback(() => {
     if (!loaded) return
     const url = `/api/files?action=download&path=${encodeURIComponent(loaded.path)}`
@@ -258,6 +268,7 @@ function FilesRoute() {
           onInsertReference={handleInsertReference}
           onOpenFile={handleOpenFile}
           activePath={loaded?.path ?? null}
+          onDeleted={handleDeleted}
         />
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <header className="flex items-center gap-3 border-b border-primary-200 px-3 py-2 md:px-4 md:py-3">
@@ -293,7 +304,9 @@ function FilesRoute() {
                 </>
               ) : (
                 <>
-                  <h1 className="hidden text-base font-medium md:block md:text-lg">Files</h1>
+                  <h1 className="hidden text-base font-medium md:block md:text-lg">
+                    Files
+                  </h1>
                   <p className="hidden text-sm text-primary-600 sm:block">
                     Click a file in the sidebar to load it into the editor.
                   </p>

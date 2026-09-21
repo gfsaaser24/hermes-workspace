@@ -4,7 +4,7 @@ import { isAuthenticated } from '../../../server/auth-middleware'
 import {
   BEARER_TOKEN,
   CLAUDE_API,
-  ensureGatewayProbed,
+  ensureGatewayProbed, dashboardFetch,
 } from '../../../server/gateway-capabilities'
 
 function authHeaders(): Record<string, string> {
@@ -36,13 +36,18 @@ export const Route = createFileRoute('/api/skills/install')({
 
           const capabilities = await ensureGatewayProbed()
           if (capabilities.dashboard.available) {
+            // hermes-jcmm: the official dashboard installs hub skills
+            // (spawns `hermes skills install <id> --yes` in the agent container).
+            const res = await dashboardFetch('/api/skills/hub/install', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ identifier }),
+              signal: AbortSignal.timeout(120_000),
+            })
+            const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>
             return json(
-              {
-                ok: false,
-                error:
-                  'Skill install is only available on the legacy enhanced fork right now.',
-              },
-              { status: 501 },
+              res.ok ? { ok: true, ...payload } : { ok: false, error: String(payload.detail || payload.error || `HTTP ${res.status}`) },
+              { status: res.ok ? 200 : res.status },
             )
           }
 

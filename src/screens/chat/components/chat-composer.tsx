@@ -48,7 +48,10 @@ import {
 import { useSettings } from '@/hooks/use-settings'
 import { MOBILE_TAB_BAR_OFFSET } from '@/components/mobile-tab-bar'
 import { useWorkspaceStore } from '@/stores/workspace-store'
-import { useSessionModelStore } from '@/stores/session-model-store'
+import {
+  getSessionModelKey,
+  useSessionModelStore,
+} from '@/stores/session-model-store'
 import { Button } from '@/components/ui/button'
 import { usePinnedModels } from '@/hooks/use-pinned-models'
 // import { ModeSelector } from '@/components/mode-selector'
@@ -61,6 +64,7 @@ import {
   emitSearchModalEvent,
 } from '@/hooks/use-search-modal'
 import { setLocalModelOverride } from '@/screens/chat/local-model-override'
+import { NEW_CHAT_MODEL_KEY } from '@/stores/session-model-store'
 import { formatModelName } from '@/lib/format-model-name'
 
 type ChatComposerAttachment = {
@@ -555,32 +559,31 @@ function readText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-function getResolvedModelKey(model: string, provider?: string): string {
+export function getResolvedModelKey(model: string, provider?: string): string {
   const normalizedModel = model.trim()
   const normalizedProvider = typeof provider === 'string' ? provider.trim() : ''
 
   if (!normalizedModel) return ''
-  if (!normalizedProvider) return normalizedModel
-  if (normalizedModel.startsWith(`${normalizedProvider}/`))
+  if (
+    !normalizedProvider ||
+    normalizedProvider === 'hermes' ||
+    normalizedProvider === 'hermes-agent'
+  )
     return normalizedModel
-  return `${normalizedProvider}/${normalizedModel}`
+  if (normalizedModel.startsWith(`${normalizedProvider}::`))
+    return normalizedModel
+  return `${normalizedProvider}::${normalizedModel}`
 }
 
 /**
  * Checks whether a model entry matches the current model string.
  *
  * The current model can arrive in several formats depending on the source:
- *   - "provider/model-id"  (from session-status API, persisted session model)
+ *   - "provider::model-id" (Hermes per-request provider selection)
+ *   - "provider/model-id"  (legacy Workspace persistence)
  *   - "model-id"           (bare ID from config or old data)
- *
- * The entry always has { id, provider } from the models catalog.
- *
- * We match if:
- *   1. The current model equals the entry ID exactly (bare match), or
- *   2. The current model ends with "/<entry.id>" (provider-prefixed match), or
- *   3. The resolved key from entry (provider/id) equals the current model.
  */
-function isCurrentModel(
+export function isCurrentModel(
   currentModel: string,
   entryId: string,
   entryProvider: string,
@@ -596,9 +599,12 @@ function isCurrentModel(
   // Current model is "something/<entryId>"
   if (cm.endsWith(`/${eid}`)) return true
 
-  // Resolved entry key matches current model exactly
-  const resolved = eprov ? `${eprov}/${eid}` : eid
-  if (resolved === cm) return true
+  // Hermes provider-qualified entry key matches current model exactly.
+  if (getResolvedModelKey(eid, eprov) === cm) return true
+
+  // Preserve recognition of browser-local values written by older Workspace builds.
+  const legacyResolved = eprov ? `${eprov}/${eid}` : eid
+  if (legacyResolved === cm) return true
 
   return false
 }
@@ -915,6 +921,7 @@ function ChatComposerComponent({
     return window.matchMedia('(max-width: 767px)').matches
   })
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false)
+  const [modelSearch, setModelSearch] = useState('') // hermes-jcmm: model picker search
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false)
   const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false)
   const [isThinkingMenuOpen, setIsThinkingMenuOpen] = useState(false)
@@ -1003,8 +1010,10 @@ function ChatComposerComponent({
     },
   })
   const currentModelQuery = useQuery({
-    queryKey: ['claude', 'session-status-model', sessionKey || 'main'],
-    queryFn: () => fetchCurrentModelFromStatus(sessionKey),
+    // hermes-jcmm: a new chat reads the gateway DEFAULT ('new'), never the
+    // floating 'main' alias, so the label cannot drift between chats.
+    queryKey: ['claude', 'session-status-model', sessionKey || 'new'],
+    queryFn: () => fetchCurrentModelFromStatus(sessionKey || 'new'),
     refetchInterval: 30_000,
     retry: false,
   })
@@ -1107,10 +1116,14 @@ function ChatComposerComponent({
   // Drives both the composer label and the model passed to startStreaming.
   // Replaces an earlier flow that PATCHed ~/.hermes/config.yaml — that path
   // 404s and would clobber the global default for every channel anyway.
+  const modelSessionKey = getSessionModelKey(sessionKey)
   const persistedSessionModel = useSessionModelStore((s) =>
-    s.getModel(sessionKey),
+    s.getModel(modelSessionKey),
   )
   const setPersistedSessionModel = useSessionModelStore((s) => s.setModel)
+  const clearPersistedSessionModel = useSessionModelStore((s) => s.clearModel)
+  // hermes-jcmm: a pick that is still being written to the agent.
+  const modelPickInFlightRef = useRef<string | null>(null)
 
   // Model switching is now per-session via the persistent store above.
   // Previously this issued a PATCH /api/hermes-proxy/api/config to write to
@@ -1122,10 +1135,7 @@ function ChatComposerComponent({
     function handleModelSelect(nextModel: string, provider?: string) {
       const model = nextModel.trim()
       if (!model) return
-      const normalizedSessionKey =
-        typeof sessionKey === 'string' && sessionKey.trim().length > 0
-          ? sessionKey.trim()
-          : undefined
+      const normalizedSessionKey = getSessionModelKey(sessionKey)
       if (
         shouldBlockZeroForkModelSwitch(
           gatewayModeQuery.data,
@@ -1138,16 +1148,43 @@ function ChatComposerComponent({
       }
       setModelNotice(null)
       const resolved = getResolvedModelKey(model, provider)
-      // Per-session, browser-local persistence. No global config write —
-      // picking a model here only affects this chat. The actual model is
-      // passed on each request via the chat-completion `model` field.
-      if (normalizedSessionKey) {
-        setPersistedSessionModel(normalizedSessionKey, resolved)
-      }
+      // Optimistic, browser-local value so the label updates instantly.
+      setPersistedSessionModel(normalizedSessionKey, resolved)
       setIsModelMenuOpen(false)
+      // hermes-jcmm: the agent is the source of truth. For an existing
+      // session, lock the pick on the gateway RIGHT NOW (Hermes per-session
+      // model lock), then re-read session-status. A new chat has no session
+      // yet; its pick is locked when the first message creates it.
+      if (normalizedSessionKey !== NEW_CHAT_MODEL_KEY && normalizedSessionKey !== 'new') {
+        modelPickInFlightRef.current = resolved
+        void (async () => {
+          try {
+            const res = await fetch(
+              `/api/claude-proxy/api/sessions/${encodeURIComponent(normalizedSessionKey)}/model`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: resolved }),
+              },
+            )
+            if (!res.ok) {
+              const text = await res.text().catch(() => '')
+              toast(`Model change was not saved on the agent (${res.status}) ${text.slice(0, 120)}`)
+              return
+            }
+            await queryClient.invalidateQueries({ queryKey: ['claude', 'session-status-model'] })
+            await queryClient.invalidateQueries({ queryKey: ['claude', 'sessions'] })
+          } catch (err) {
+            toast(`Model change was not saved on the agent: ${err instanceof Error ? err.message : String(err)}`)
+          } finally {
+            if (modelPickInFlightRef.current === resolved) modelPickInFlightRef.current = null
+          }
+        })()
+      }
     },
     [
       gatewayModeQuery.data,
+      queryClient,
       sessionKey,
       setPersistedSessionModel,
       zeroForkModelInfoFlags,
@@ -1190,6 +1227,17 @@ function ChatComposerComponent({
     'Workspace'
 
   const currentModel = currentModelQuery.data ?? ''
+  // hermes-jcmm: the agent is the source of truth for an existing session.
+  // Once session-status reports a model and no pick is in flight, drop the
+  // browser-local optimistic value so every device shows the same thing.
+  useEffect(() => {
+    if (!sessionKey || modelSessionKey === NEW_CHAT_MODEL_KEY) return
+    if (!currentModel || !persistedSessionModel) return
+    if (modelPickInFlightRef.current) return
+    if (isCurrentModel(currentModel, persistedSessionModel, '') || currentModel === persistedSessionModel) {
+      clearPersistedSessionModel(modelSessionKey)
+    }
+  }, [clearPersistedSessionModel, currentModel, modelSessionKey, persistedSessionModel, sessionKey])
 
   // Auto-switch to hermes-agent model on mount (Hermes Workspace uses Hermes Agent)
   // Removed: auto-switch to hermes-agent. The workspace respects the
@@ -2962,11 +3010,31 @@ function ChatComposerComponent({
                             </button>
                             {isModelMenuOpen && (
                               <>
-                                <div className="fixed inset-0 z-[199]" onClick={() => setIsModelMenuOpen(false)} />
+                                <div className="fixed inset-0 z-[199]" onClick={() => { setModelSearch(''); setIsModelMenuOpen(false) }} />
                                 <div className="absolute bottom-full left-0 mb-2 z-[200] w-[min(28rem,calc(100vw-2rem))] min-w-[18rem] origin-bottom-left overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-xl dark:border-neutral-700 dark:bg-neutral-900 animate-in fade-in slide-in-from-bottom-2 duration-150">
+                                  {/* hermes-jcmm: search box (filters id / name / provider) */}
+                                  <div className="border-b border-neutral-200 p-1.5 dark:border-neutral-700">
+                                    <input
+                                      type="search"
+                                      autoFocus
+                                      value={modelSearch}
+                                      onChange={(e) => setModelSearch(e.target.value)}
+                                      onKeyDown={(e) => { if (e.key === 'Escape') { setModelSearch(''); setIsModelMenuOpen(false) } }}
+                                      placeholder="Search models…"
+                                      aria-label="Search models"
+                                      className="w-full rounded-md border border-neutral-200 bg-white px-2 py-1 text-sm outline-none focus:border-neutral-400 dark:border-neutral-700 dark:bg-neutral-800 dark:focus:border-neutral-500"
+                                    />
+                                  </div>
                                   <div className="max-h-[20rem] overflow-y-auto overflow-x-hidden p-1">
                                     {(() => {
-                                      const allModels = modelsQuery.data?.models ?? []
+                                      const q = modelSearch.trim().toLowerCase()
+                                      const allModels = (modelsQuery.data?.models ?? []).filter((m) => {
+                                        if (!q) return true
+                                        const rec = typeof m === 'string' ? { id: m } : (m as Record<string, unknown>)
+                                        const hay = [rec.id, rec.name, rec.displayName, rec.label, rec.model, rec.provider]
+                                          .filter((v) => typeof v === 'string').join(' ').toLowerCase()
+                                        return q.split(/\s+/).every((t) => hay.includes(t))
+                                      })
                                       const defaultProvider = modelsQuery.data?.currentProvider ?? ''
                                       if (allModels.length === 0) {
                                         return <div className="p-4 text-center text-sm text-neutral-500">No models available</div>

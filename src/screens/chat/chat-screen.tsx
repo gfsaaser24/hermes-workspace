@@ -25,6 +25,7 @@ import {
   isTerminalActiveRunStatus,
   shouldClearWaitingForAssistantMessage
 } from './chat-screen-utils'
+import { buildNavKey, shouldCancelStreamOnNav } from './nav-cancel'
 import {
   appendHistoryMessage,
   chatQueryKeys,
@@ -55,6 +56,7 @@ import { snapshotOptimisticUserMessages } from './hooks/optimistic-message-reinj
 import { useSmoothStreamingText } from './hooks/use-smooth-streaming-text'
 import { useStreamingMessage } from './hooks/use-streaming-message'
 import { useActiveRunCheck } from './hooks/use-active-run-check'
+import { requestRunStop, useRunResume } from './hooks/use-run-resume'
 import { useChatMobile } from './hooks/use-chat-mobile'
 import { useChatSessions } from './hooks/use-chat-sessions'
 import { useAutoSessionTitle } from './hooks/use-auto-session-title'
@@ -106,7 +108,11 @@ import { ContextAlertModal } from '@/components/usage-meter/context-alert-modal'
 import { ErrorToastContainer, showErrorToast } from '@/components/error-toast'
 // ContextMeter removed — ContextBar (PR #32) replaces it
 import { persistRecoveryMessage, useChatStore } from '@/stores/chat-store'
-import { useSessionModelStore } from '@/stores/session-model-store'
+import {
+  NEW_CHAT_MODEL_KEY,
+  getSessionModelKey,
+  useSessionModelStore,
+} from '@/stores/session-model-store'
 import { useResearchCard } from '@/hooks/use-research-card'
 // MOBILE_TAB_BAR_OFFSET removed — tab bar always hidden in chat
 import { useTapDebug } from '@/hooks/use-tap-debug'
@@ -997,15 +1003,21 @@ export function ChatScreen({
     staleTime: 5 * 60 * 1000, // 5 minutes
   })
 
+  // hermes-jcmm: a brand-new chat must read the GATEWAY DEFAULT ('new'), never
+  // the floating 'main' alias (= whichever chat was most recently active), or
+  // the composer label drifts on every refetch/focus.
+  const currentModelStatusKey = isNewChat
+    ? 'new'
+    : resolvedSessionKey || activeFriendlyId || 'main'
   const currentModelQuery = useQuery({
     queryKey: [
       'claude',
       'session-status-model',
-      resolvedSessionKey || activeFriendlyId || 'main',
+      currentModelStatusKey,
     ],
     queryFn: async () => {
       try {
-        const statusSessionKey = resolvedSessionKey || activeFriendlyId || 'main'
+        const statusSessionKey = currentModelStatusKey
         const query = statusSessionKey
           ? `?sessionKey=${encodeURIComponent(statusSessionKey)}`
           : ''
@@ -1057,8 +1069,20 @@ export function ChatScreen({
     return models.map((m: any) => m.id).filter((id: string) => id)
   }, [modelsQuery.data])
 
+  const modelSessionKey = getSessionModelKey(
+    isNewChat
+      ? undefined
+      : forcedSessionKey ||
+          resolvedSessionKey ||
+          activeCanonicalKey ||
+          activeSessionKey,
+  )
+  const persistedSessionModel = useSessionModelStore((state) =>
+    state.getModel(modelSessionKey),
+  )
   const gatewayModel = currentModelQuery.data || ''
-  const currentModel = _localModelOverride || gatewayModel
+  const currentModel =
+    _localModelOverride || persistedSessionModel || gatewayModel
 
   // Ref so sendMessage can always read latest thinkingLevel without being in deps
   const thinkingLevelRef = useRef<ThinkingLevel>(thinkingLevel)
@@ -1145,6 +1169,24 @@ export function ChatScreen({
             sessionKey,
             friendlyId,
           }
+          // hermes-jcmm: on /chat/new the waiting flag was stored under the
+          // alias key the history hook resolves for a new chat ('main'), so
+          // once the URL became /chat/<id> the real session had no flag
+          // (Stop + thinking gone) and `main` kept a ghost one. Move it.
+          const store = useChatStore.getState()
+          const aliasKey = sessionKeyForWaiting.current
+          if (aliasKey && aliasKey !== sessionKey && isNewChat) {
+            store.clearSessionWaiting(aliasKey)
+          }
+          store.setSessionWaiting(sessionKey)
+        }
+        if (isNewChat) {
+          const modelStore = useSessionModelStore.getState()
+          const newChatModel = modelStore.getModel(NEW_CHAT_MODEL_KEY)
+          if (newChatModel) {
+            modelStore.setModel(sessionKey, newChatModel)
+            modelStore.clearModel(NEW_CHAT_MODEL_KEY)
+          }
         }
         if (
           sessionKey === activeFriendlyId &&
@@ -1154,7 +1196,7 @@ export function ChatScreen({
         }
         onSessionResolved?.({ sessionKey, friendlyId })
       },
-      [activeFriendlyId, onSessionResolved],
+      [activeFriendlyId, isNewChat, onSessionResolved],
     ),
     onStarted: useCallback(
       ({ runId }: { runId: string | null }) => {
@@ -1278,6 +1320,20 @@ export function ChatScreen({
     handoffTimeoutMs: modelsQuery.data?.streamHandoffTimeoutMs,
   })
 
+  // hermes-jcmm: re-attach to a run that is still executing server-side after
+  // a reload / tab switch / dropped SSE. Replays the tool cards + text so far,
+  // then tails the live run. Only runs when no local send-stream is attached.
+  const { resumedRunId, resumeStalled, stopResumedRun } = useRunResume({
+    sessionKey: resolvedSessionKey || '',
+    enabled: !isNewChat && Boolean(resolvedSessionKey),
+    isLocalStreamActive: localIsStreaming || sending,
+    onRunComplete: useCallback(() => {
+      // History may have been compacted mid-run (hermes-lcm). Refetching is
+      // always safe — a shorter message list is a valid result, never an error.
+      refreshHistoryRef.current()
+    }, []),
+  })
+
   // Cancel any in-flight stream when the user navigates between sessions or
   // starts a new chat. Without this, an SSE stream from session A keeps
   // running after the user navigates away — and any chunks it had already
@@ -1287,17 +1343,23 @@ export function ChatScreen({
   // the buffered-chunk race, but cancelling here is the cleaner contract
   // (an in-flight response that the user navigated away from is no longer
   // wanted in either session).
+  // hermes-jcmm: the first message of a new chat changes this key too
+  // (/chat/new -> /chat/<id> once the gateway names the session). That is the
+  // stream's OWN session, not a navigation — cancelling there killed the turn
+  // ~5s in (Stop + thinking gone, tool cards only after a reload).
   const navCancelKeyRef = useRef<string | null>(null)
   useEffect(() => {
-    const navKey = `${activeCanonicalKey ?? ''}::${isNewChat ? 'new' : activeFriendlyId}`
-    if (navCancelKeyRef.current === null) {
-      navCancelKeyRef.current = navKey
-      return
-    }
-    if (navCancelKeyRef.current !== navKey) {
-      navCancelKeyRef.current = navKey
-      cancelStreaming()
-    }
+    const navKey = buildNavKey(activeCanonicalKey, isNewChat, activeFriendlyId)
+    const cancel = shouldCancelStreamOnNav({
+      previousNavKey: navCancelKeyRef.current,
+      navKey,
+      isNewChat,
+      activeFriendlyId,
+      activeCanonicalKey,
+      activeSend: activeSendRef.current,
+    })
+    navCancelKeyRef.current = navKey
+    if (cancel) cancelStreaming()
   }, [activeCanonicalKey, activeFriendlyId, isNewChat, cancelStreaming])
 
   const activeIsRealtimeStreaming = isPortableMode
@@ -1393,7 +1455,12 @@ export function ChatScreen({
 
       const text = stripQueuedWrapper(textFromMessage(msg)).trim()
       if (text.length > 0) {
-        const normalizedText = text.replace(/\s+/g, ' ')
+        // hermes-jcmm: the transcript stores an image part as `[screenshot]`;
+        // the optimistic row has the picture instead. Same message.
+        const normalizedText =
+          msg.role === 'user'
+            ? text.replace(/\[screenshot\]/gi, '').replace(/\s+/g, ' ').trim()
+            : text.replace(/\s+/g, ' ')
         const textKey = `${msg.role}:text:${normalizedText}`
         const existingTextMatch = seenByText.get(textKey)
         if (
@@ -1442,9 +1509,19 @@ export function ChatScreen({
     // that overlaps with the streaming text. If so, drop the streaming
     // placeholder to avoid showing the same response twice.
     const streamingText = stableActiveStreamingText.trim()
-    const hasServerAssistantVersion = nextMessages.some((msg) => {
+    // hermes-jcmm: only a message that arrived AFTER the last user message can
+    // be this run's reply. Scanning the whole thread let an earlier turn with
+    // the same tool-call shape swallow the placeholder; derivedStreamingInfo
+    // then pointed streamingMessageId at the PREVIOUS turn's bubble, which
+    // rendered the live tool calls on top of its own ("1 running · 3 done").
+    const lastUserIdxForMatch = nextMessages.reduce(
+      (lastIdx, msg, idx) => (msg.role === 'user' ? idx : lastIdx),
+      -1,
+    )
+    const hasServerAssistantVersion = nextMessages.some((msg, idx) => {
       if (msg.role !== 'assistant') return false
       if (msg.__streamingStatus === 'streaming') return false
+      if (idx <= lastUserIdxForMatch) return false
       // Any non-streaming assistant message that appears after the last user
       // message is potentially the same response — match by text overlap
       if (streamingText.length > 0) {
@@ -1555,6 +1632,12 @@ export function ChatScreen({
     activeRealtimeStreamingRef.current = activeIsRealtimeStreaming
   }, [activeIsRealtimeStreaming])
 
+  // hermes-jcmm: "a stream is attached to this run" for the 120s failsafe.
+  const streamAttachedRef = useRef(false)
+  useEffect(() => {
+    streamAttachedRef.current = localIsStreaming || Boolean(resumedRunId)
+  }, [localIsStreaming, resumedRunId])
+
   useEffect(() => {
     if (!waitingForResponse) {
       responseWaitSnapshotRef.current = null
@@ -1575,6 +1658,12 @@ export function ChatScreen({
     }
     const snapshot = responseWaitSnapshotRef.current
     if (!snapshot) return
+    // hermes-jcmm: this is the "no SSE told us the turn ended" fallback. While
+    // a stream is attached (local send or re-attached run) every tool step the
+    // agent takes lands in history as a new assistant row, which this used to
+    // read as "the answer arrived" -> Stop + thinking gone ~1s into the turn.
+    // The attached stream's done/complete path clears waiting instead.
+    if (localIsStreaming || resumedRunId) return
     if (shouldClearWaitingForAssistantMessage(finalDisplayMessages, snapshot)) {
       if (clearTimerRef.current) return
       clearTimerRef.current = window.setTimeout(() => {
@@ -1582,7 +1671,13 @@ export function ChatScreen({
         streamFinish()
       }, 50)
     }
-  }, [finalDisplayMessages, waitingForResponse, streamFinish])
+  }, [
+    finalDisplayMessages,
+    waitingForResponse,
+    streamFinish,
+    localIsStreaming,
+    resumedRunId,
+  ])
 
   useEffect(() => {
     const wasStreaming = prevIsRealtimeStreamingRef.current
@@ -1749,6 +1844,10 @@ export function ChatScreen({
   const shouldRedirectToNew =
     !isNewChat &&
     !forcedSessionKey &&
+    // hermes-jcmm: never bounce the user out of a session whose agent is
+    // still working — the sessions list can lag a freshly created session.
+    !resumedRunId &&
+    !waitingForResponse &&
     !isRecentSession(activeFriendlyId) &&
     sessionsQuery.isSuccess &&
     sessions.length > 0 &&
@@ -1980,14 +2079,24 @@ export function ChatScreen({
         clientId: optimisticClientId,
       }
 
-      // Failsafe: clear waitingForResponse after 120s no matter what
-      // Prevents infinite spinner if SSE/idle detection both fail
+      // Failsafe: clear waitingForResponse after 120s if SSE/idle detection
+      // both fail. hermes-jcmm: run-aware — while a stream is still attached
+      // the turn is simply long (agent turns run for many minutes), so re-arm
+      // instead of hiding Stop + thinking on a live run.
       if (failsafeTimerRef.current) {
         window.clearTimeout(failsafeTimerRef.current)
       }
-      failsafeTimerRef.current = window.setTimeout(() => {
-        streamFinish()
-      }, 120_000)
+      const armFailsafe = () => {
+        failsafeTimerRef.current = window.setTimeout(() => {
+          failsafeTimerRef.current = null
+          if (streamAttachedRef.current) {
+            armFailsafe()
+            return
+          }
+          streamFinish()
+        }, 120_000)
+      }
+      armFailsafe()
 
       // Send a compatibility shape for attachment parsing.
       // Different server/channel versions read different keys.
@@ -2542,11 +2651,40 @@ export function ChatScreen({
       )
     }
     activeSendRef.current = null
+    // hermes-jcmm: a browser disconnect deliberately KEEPS the agent running
+    // now, so Stop has to say stop out loud — otherwise the run keeps burning
+    // tokens after the user hit the button. Fire-and-forget, before we tear
+    // the local stream down. Navigating away must never reach this path.
+    {
+      const stopSessionKey = resolvedSessionKey || activeCanonicalKey || ''
+      const stopRunId =
+        resumedRunId ??
+        streamingRunId ??
+        useChatStore.getState().waitingSessionMeta[stopSessionKey]?.runId ??
+        null
+      if (stopSessionKey && stopRunId) {
+        void requestRunStop(stopSessionKey, stopRunId).then((stopped) => {
+          if (!stopped) {
+            toast('Could not stop the agent run — it may still be working', {
+              type: 'error',
+            })
+          }
+        })
+      }
+    }
     cancelStreaming()
     setSending(false)
     setPendingGeneration(false)
     setWaitingForResponse(false)
-  }, [cancelStreaming, queryClient])
+  }, [
+    activeCanonicalKey,
+    cancelStreaming,
+    queryClient,
+    resolvedSessionKey,
+    resumedRunId,
+    setWaitingForResponse,
+    streamingRunId,
+  ])
 
   const runPaletteSlashCommand = useCallback(
     (command: string) => {
@@ -2791,6 +2929,27 @@ export function ChatScreen({
           {errorNotice && (
             <div className="sticky top-0 z-20 px-4 py-2">{errorNotice}</div>
           )}
+          {/* hermes-jcmm: replaces the dead spinner after a reload mid-run. */}
+          {resumedRunId && (
+            <div
+              className="mx-4 mb-2 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 py-2 text-sm text-sky-900 dark:border-sky-800/50 dark:bg-sky-900/15 dark:text-sky-100"
+              data-testid="run-resume-notice"
+            >
+              <span className="size-2 animate-pulse rounded-full bg-sky-500" />
+              <span>
+                {resumeStalled
+                  ? 'Still working — waiting for the agent'
+                  : 'Reconnected — agent still working'}
+              </span>
+              <button
+                type="button"
+                className="ml-auto rounded-lg border border-sky-300 px-2 py-0.5 text-xs font-medium hover:bg-sky-100 dark:border-sky-700 dark:hover:bg-sky-900/40"
+                onClick={stopResumedRun}
+              >
+                Stop
+              </button>
+            </div>
+          )}
           {pendingApprovals.length > 0 && (
             <div className="mx-4 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-800/50 dark:bg-amber-900/15">
               <div className="space-y-2">
@@ -2901,7 +3060,15 @@ export function ChatScreen({
             <ChatComposer
               onSubmit={send}
               onAbort={handleAbortStreaming}
-              isLoading={sending || waitingForResponse}
+              // hermes-jcmm: Stop must stay reachable for the whole run — a
+              // live local stream or a re-attached run counts, not only the
+              // waiting flag (which several fallbacks may clear early).
+              isLoading={
+                sending ||
+                waitingForResponse ||
+                localIsStreaming ||
+                Boolean(resumedRunId)
+              }
               disabled={sending || hideUi}
               sessionKey={
                 isNewChat

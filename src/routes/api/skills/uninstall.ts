@@ -4,7 +4,7 @@ import { isAuthenticated } from '../../../server/auth-middleware'
 import {
   BEARER_TOKEN,
   CLAUDE_API,
-  ensureGatewayProbed,
+  ensureGatewayProbed, dashboardFetch,
 } from '../../../server/gateway-capabilities'
 
 function authHeaders(): Record<string, string> {
@@ -33,13 +33,17 @@ export const Route = createFileRoute('/api/skills/uninstall')({
 
           const capabilities = await ensureGatewayProbed()
           if (capabilities.dashboard.available) {
+            // hermes-jcmm: official dashboard uninstall (spawns `hermes skills uninstall`).
+            const res = await dashboardFetch('/api/skills/hub/uninstall', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name }),
+              signal: AbortSignal.timeout(60_000),
+            })
+            const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>
             return json(
-              {
-                ok: false,
-                error:
-                  'Skill uninstall is only available on the legacy enhanced fork right now.',
-              },
-              { status: 501 },
+              res.ok ? { ok: true, ...payload } : { ok: false, error: String(payload.detail || payload.error || `HTTP ${res.status}`) },
+              { status: res.ok ? 200 : res.status },
             )
           }
 

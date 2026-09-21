@@ -196,6 +196,8 @@ export function useRealtimeChatHistory({
           const msgText = extractUserMessageText(message)
           if (
             msgText.startsWith('Pre-compaction memory flush') ||
+            // hermes-jcmm: hermes-lcm compaction summary row (role 'user').
+            msgText.startsWith('[CONTEXT COMPACTION') ||
             msgText.startsWith('Store durable memories now') ||
             msgText.startsWith('APPEND new content only and do not overwrite') ||
             msgText.startsWith('A subagent task') ||

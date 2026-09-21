@@ -72,6 +72,26 @@ export function shouldBindMainToPortableSession({
   )
 }
 
+
+// hermes-jcmm: on our deployment the gateway has a REAL session whose id is
+// literally 'main'. When it exists, 'main' must never be treated as the
+// portable/local alias. Cached briefly; failures mean "no real main".
+let _realMainCache: { at: number; value: boolean } | null = null
+export async function hasRealMainSession(): Promise<boolean> {
+  const now = Date.now()
+  if (_realMainCache && now - _realMainCache.at < 15_000) return _realMainCache.value
+  let value = false
+  try {
+    const { getSession } = await import('./claude-api')
+    const real = await getSession('main')
+    value = Boolean(real && real.id === 'main')
+  } catch {
+    value = false
+  }
+  _realMainCache = { at: now, value }
+  return value
+}
+
 export async function resolveSessionKey({
   rawSessionKey,
   friendlyId,

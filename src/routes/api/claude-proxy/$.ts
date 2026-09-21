@@ -55,6 +55,12 @@ async function proxyRequest(request: Request, splat: string) {
   const headers = new Headers(request.headers)
   headers.delete('host')
   headers.delete('content-length')
+  // hermes-jcmm: this is a server-to-server hop. Browser-only headers make the
+  // gateway's origin guard 403 non-GET calls (e.g. POST /api/sessions/{id}/model)
+  // and the workspace cookie must never be forwarded upstream.
+  for (const h of ['origin', 'referer', 'cookie', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user']) {
+    headers.delete(h)
+  }
   // Read at request time — follows the same fix as PR #234.
   const bearer =
     process.env.HERMES_API_TOKEN || process.env.CLAUDE_API_TOKEN || BEARER_TOKEN
