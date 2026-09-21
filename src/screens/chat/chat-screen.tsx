@@ -1455,7 +1455,12 @@ export function ChatScreen({
 
       const text = stripQueuedWrapper(textFromMessage(msg)).trim()
       if (text.length > 0) {
-        const normalizedText = text.replace(/\s+/g, ' ')
+        // hermes-jcmm: the transcript stores an image part as `[screenshot]`;
+        // the optimistic row has the picture instead. Same message.
+        const normalizedText =
+          msg.role === 'user'
+            ? text.replace(/\[screenshot\]/gi, '').replace(/\s+/g, ' ').trim()
+            : text.replace(/\s+/g, ' ')
         const textKey = `${msg.role}:text:${normalizedText}`
         const existingTextMatch = seenByText.get(textKey)
         if (

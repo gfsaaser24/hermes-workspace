@@ -193,6 +193,18 @@ function isOptimisticUserMessage(message: ChatMessage): boolean {
   )
 }
 
+// hermes-jcmm: the agent's transcript is text-only — every image part of a
+// user message is stored as the literal `[screenshot]` (agent
+// session_persistence.py). The optimistic row we rendered has the real image
+// and no marker, so text equality failed and a message with an attachment
+// showed twice (once with the picture, once with "[screenshot]").
+export function userTextForMatch(message: ChatMessage): string {
+  return textFromMessage(message)
+    .replace(/\[screenshot\]/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function isSameUserMessage(a: ChatMessage, b: ChatMessage): boolean {
   if (a.role !== 'user' || b.role !== 'user') return false
 
@@ -200,8 +212,8 @@ function isSameUserMessage(a: ChatMessage, b: ChatMessage): boolean {
   const bClientId = getMessageClientId(b)
   if (aClientId && bClientId && aClientId === bClientId) return true
 
-  const aText = textFromMessage(a).trim()
-  const bText = textFromMessage(b).trim()
+  const aText = userTextForMatch(a)
+  const bText = userTextForMatch(b)
   if (aText && bText && aText === bText) return true
 
   const aAttachments = getAttachmentSignature(a)
@@ -243,7 +255,10 @@ function historyContainsMessage(
   candidate: ChatMessage,
 ): boolean {
   if (!candidate.role) return false
-  const candidateText = textFromMessage(candidate).trim()
+  const candidateText =
+    candidate.role === 'user'
+      ? userTextForMatch(candidate)
+      : textFromMessage(candidate).trim()
   const candidateId = extractMsgId(candidate)
 
   return messages.some((msg) => {
@@ -251,7 +266,8 @@ function historyContainsMessage(
     const msgId = extractMsgId(msg)
     if (candidateId && msgId && candidateId === msgId) return true
     if (candidateText) {
-      const msgText = textFromMessage(msg).trim()
+      const msgText =
+        msg.role === 'user' ? userTextForMatch(msg) : textFromMessage(msg).trim()
       if (msgText === candidateText) return true
     }
     return false
