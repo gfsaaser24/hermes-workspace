@@ -21,24 +21,45 @@ const scripts = new Map<string, Array<StreamFrame>>()
 /** Per-run delay before the stream response resolves (races the next attach). */
 const streamDelays = new Map<string, number>()
 const openStreams = new Set<() => void>()
+/** Live controllers of held-open streams, so a test can push a late frame. */
+const liveStreams = new Map<
+  string,
+  ReadableStreamDefaultController<Uint8Array>
+>()
+/** The AbortSignal the hook handed to fetch for each run's stream. */
+const streamSignals = new Map<string, AbortSignal>()
 
-function sseBody(script: Array<StreamFrame>, hold: boolean) {
+function frameBytes(frame: StreamFrame) {
+  return new TextEncoder().encode(
+    `event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`,
+  )
+}
+
+/**
+ * Push an SSE frame into a stream that is still open. The mock fetch ignores
+ * the abort signal on purpose, so this models the nastiest real case: a
+ * detached reader that is still live and still receiving events.
+ */
+function pushFrame(runId: string, frame: StreamFrame) {
+  const controller = liveStreams.get(runId)
+  if (!controller) throw new Error(`no open stream for ${runId}`)
+  controller.enqueue(frameBytes(frame))
+}
+
+function sseBody(runId: string, script: Array<StreamFrame>, hold: boolean) {
   return new ReadableStream<Uint8Array>({
     start(controller) {
-      const encoder = new TextEncoder()
       for (const frame of script) {
-        controller.enqueue(
-          encoder.encode(
-            `event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`,
-          ),
-        )
+        controller.enqueue(frameBytes(frame))
       }
       if (!hold) {
         controller.close()
         return
       }
       // Stay open like a real live tail until the test tears down.
+      liveStreams.set(runId, controller)
       openStreams.add(() => {
+        liveStreams.delete(runId)
         try {
           controller.close()
         } catch {
@@ -52,7 +73,7 @@ function sseBody(script: Array<StreamFrame>, hold: boolean) {
 function installFetch(activeRuns: Record<string, string | null>) {
   vi.stubGlobal(
     'fetch',
-    vi.fn((input: RequestInfo | URL) => {
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       const activeMatch = /\/api\/sessions\/([^/]+)\/active-run/.exec(url)
       if (activeMatch) {
@@ -70,9 +91,12 @@ function installFetch(activeRuns: Record<string, string | null>) {
       const streamMatch = /\/api\/runs\/([^/]+)\/([^/]+)\/stream/.exec(url)
       if (streamMatch) {
         const runId = decodeURIComponent(streamMatch[2])
+        if (init?.signal) streamSignals.set(runId, init.signal)
         const script = scripts.get(runId) ?? []
         const hold = !script.some((f) => f.event === 'done')
-        const response = new Response(sseBody(script, hold), { status: 200 })
+        const response = new Response(sseBody(runId, script, hold), {
+          status: 200,
+        })
         const delay = streamDelays.get(runId) ?? 0
         if (delay > 0) {
           return new Promise<Response>((resolve) =>
@@ -94,18 +118,22 @@ function mountHook(
 ): {
   latest: () => HookResult
   setSessionKey: (key: string) => Promise<void>
+  setLocalStreamActive: (active: boolean) => Promise<void>
   unmount: () => Promise<void>
 } {
   const seen: { current: HookResult | null } = { current: null }
   let setKey: ((key: string) => void) | null = null
+  let setLocal: ((active: boolean) => void) | null = null
 
   function Harness() {
     const [sessionKey, setSessionKey] = React.useState(initialSessionKey)
+    const [localStreamActive, setLocalStreamActive] = React.useState(false)
     setKey = setSessionKey
+    setLocal = setLocalStreamActive
     seen.current = useRunResume({
       sessionKey,
       enabled: true,
-      isLocalStreamActive: false,
+      isLocalStreamActive: localStreamActive,
       onRunComplete,
     })
     return null
@@ -123,6 +151,12 @@ function mountHook(
     setSessionKey: async (key: string) => {
       await React.act(async () => {
         setKey?.(key)
+        await Promise.resolve()
+      })
+    },
+    setLocalStreamActive: async (active: boolean) => {
+      await React.act(async () => {
+        setLocal?.(active)
         await Promise.resolve()
       })
     },
@@ -145,6 +179,8 @@ beforeEach(() => {
   scripts.clear()
   streamDelays.clear()
   openStreams.clear()
+  liveStreams.clear()
+  streamSignals.clear()
   useChatStore.setState({
     realtimeMessages: new Map(),
     streamingState: new Map(),
@@ -157,6 +193,7 @@ beforeEach(() => {
 afterEach(() => {
   for (const close of openStreams) close()
   openStreams.clear()
+  liveStreams.clear()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -250,6 +287,111 @@ describe('useRunResume attachment', () => {
     expect(hook.latest().resumedRunId).toBeNull()
     expect(hook.latest().resumeStalled).toBe(false)
     expect(useChatStore.getState().isSessionWaiting('C')).toBe(false)
+    await hook.unmount()
+  })
+
+  it('detaches the resumed stream the moment a new local send starts', async () => {
+    scripts.set('run-old', [
+      { event: 'started', data: { runId: 'run-old', sessionKey: 'L' } },
+      {
+        event: 'chunk',
+        data: { runId: 'run-old', text: 'previous reply', fullReplace: true },
+      },
+    ])
+    installFetch({ L: 'run-old' })
+
+    const hook = mountHook('L')
+    await settle(40)
+    expect(hook.latest().resumedRunId).toBe('run-old')
+    expect(useChatStore.getState().getStreamingState('L')?.text).toBe(
+      'previous reply',
+    )
+
+    // The user sends a new message in the same chat.
+    await hook.setLocalStreamActive(true)
+    await settle(20)
+
+    expect(hook.latest().resumedRunId).toBeNull()
+    expect(hook.latest().resumeStalled).toBe(false)
+    expect(streamSignals.get('run-old')?.aborted).toBe(true)
+    // The new send owns the waiting state now — detaching must not clear it.
+    expect(useChatStore.getState().isSessionWaiting('L')).toBe(true)
+    await hook.unmount()
+  })
+
+  it('ignores chunks and a late done from a stream it already detached', async () => {
+    scripts.set('run-old', [
+      { event: 'started', data: { runId: 'run-old', sessionKey: 'D' } },
+      {
+        event: 'chunk',
+        data: { runId: 'run-old', text: 'previous reply', fullReplace: true },
+      },
+    ])
+    installFetch({ D: 'run-old' })
+
+    const hook = mountHook('D')
+    await settle(40)
+    expect(hook.latest().resumedRunId).toBe('run-old')
+
+    await hook.setLocalStreamActive(true)
+    await settle(20)
+
+    // Stand in for the new local send: it owns the row and the spinner.
+    React.act(() => {
+      useChatStore.getState().setSessionWaiting('D', 'run-new')
+    })
+    useChatStore.getState().processEvent({
+      type: 'chunk',
+      text: 'new reply',
+      fullReplace: true,
+      runId: 'run-new',
+      sessionKey: 'D',
+      transport: 'send-stream',
+    })
+
+    // The abandoned run keeps talking: more accumulated text, then it ends.
+    pushFrame('run-old', {
+      event: 'chunk',
+      data: { runId: 'run-old', text: 'previous reply, continued' },
+    })
+    pushFrame('run-old', {
+      event: 'done',
+      data: { runId: 'run-old', sessionKey: 'D', state: 'complete' },
+    })
+    await settle(60)
+
+    // Neither the text nor the spinner of the new run was touched.
+    expect(useChatStore.getState().getStreamingState('D')?.text).toBe(
+      'new reply',
+    )
+    expect(useChatStore.getState().isSessionWaiting('D')).toBe(true)
+    expect(useChatStore.getState().getRealtimeMessages('D')).toHaveLength(0)
+    await hook.unmount()
+  })
+
+  it('still seeds the streaming row on a plain reload re-attach', async () => {
+    scripts.set('run-r', [
+      { event: 'started', data: { runId: 'run-r', sessionKey: 'R' } },
+    ])
+    installFetch({ R: 'run-r' })
+
+    const hook = mountHook('R')
+    await settle(40)
+
+    expect(hook.latest().resumedRunId).toBe('run-r')
+    expect(useChatStore.getState().getStreamingState('R')).toBeTruthy()
+    expect(useChatStore.getState().getStreamingState('R')?.text).toBe('')
+    expect(useChatStore.getState().isSessionWaiting('R')).toBe(true)
+
+    // And the live tail still lands once it arrives.
+    pushFrame('run-r', {
+      event: 'chunk',
+      data: { runId: 'run-r', text: 'live text' },
+    })
+    await settle(40)
+    expect(useChatStore.getState().getStreamingState('R')?.text).toBe(
+      'live text',
+    )
     await hook.unmount()
   })
 })

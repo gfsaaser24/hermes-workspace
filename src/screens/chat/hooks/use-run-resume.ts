@@ -242,6 +242,14 @@ export function useRunResume({
     const store = useChatStore.getState()
     store.setSessionWaiting(key, runId)
 
+    // Identity guard: a session switch — or a new local send — replaces this
+    // attachment. Everything a detached stream still produces (replayed text,
+    // a late 'done', an error) must be a no-op: the old run's accumulated text
+    // would otherwise overwrite the new run's live text, and its 'done' would
+    // kill the new run's spinner.
+    const isOwner = () =>
+      controllerRef.current === controller && !controller.signal.aborted
+
     let outcome: ResumeOutcome = 'open'
     try {
       const response = await fetch(
@@ -260,6 +268,8 @@ export function useRunResume({
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        // Detached while we were waiting on the socket — drop the payload.
+        if (!isOwner()) return
         buffer += decoder.decode(value, { stream: true })
         const blocks = buffer.split('\n\n')
         buffer = blocks.pop() ?? ''
@@ -279,6 +289,9 @@ export function useRunResume({
           } catch {
             continue
           }
+          // Re-checked per event: detaching is synchronous, but this loop is
+          // not — a detached reader must not reach the store mid-block.
+          if (!isOwner()) return
           outcome = applyResumeEvent({
             event: eventName,
             data: parsed,
@@ -313,7 +326,11 @@ export function useRunResume({
       // Network error — drop the waiting state so the UI never sits on a dead
       // spinner. Never touch it after an abort or a session switch: that run
       // (and another session's state) is not ours to clear.
-      if (!controller.signal.aborted && sessionKeyRef.current === key) {
+      if (
+        !controller.signal.aborted &&
+        controllerRef.current === controller &&
+        sessionKeyRef.current === key
+      ) {
         useChatStore.getState().clearSessionWaiting(key)
       }
     } finally {
@@ -361,6 +378,18 @@ export function useRunResume({
     void checkForActiveRun()
     // detach is stable; re-run whenever the session or enablement changes.
   }, [sessionKey, enabled, checkForActiveRun, detach])
+
+  // hermes-jcmm: the user sent a new message in this same chat. The local
+  // send-stream owns the session from here, so let go of the resumed run at
+  // once — otherwise the old run's accumulated text keeps overwriting the new
+  // reply and its 'done' clears the new run's spinner.
+  //
+  // Deliberately NOT clearing the session waiting state: the new send owns it.
+  useEffect(() => {
+    if (!isLocalStreamActive) return
+    detach()
+    // detach is stable; this only has to fire when a local send takes over.
+  }, [isLocalStreamActive, detach])
 
   useEffect(() => {
     if (typeof window === 'undefined') return

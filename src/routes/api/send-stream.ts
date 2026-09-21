@@ -70,6 +70,52 @@ function readNumber(value: unknown): number | undefined {
   return undefined
 }
 
+/** Flatten an agent message body (string, content-part array, or message
+ *  object) down to plain text. */
+function extractMessageText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => {
+        if (typeof part === 'string') return part
+        if (part && typeof part === 'object') {
+          const partText = (part as Record<string, unknown>).text
+          if (typeof partText === 'string') return partText
+        }
+        return ''
+      })
+      .join('')
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    if ('content' in obj) return extractMessageText(obj.content)
+    if (typeof obj.text === 'string') return obj.text
+  }
+  return ''
+}
+
+/**
+ * hermes-jcmm: the final assistant text carried by a `run.completed` payload.
+ *
+ * The agent puts the authoritative per-turn transcript on `run.completed`
+ * (`messages: [...]`); older/other builds only carry `content` or `message`.
+ * Returns '' when nothing non-blank is there.
+ */
+function readFinalAssistantText(data: Record<string, unknown>): string {
+  const messages = Array.isArray(data.messages) ? data.messages : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const entry = messages[i]
+    if (!entry || typeof entry !== 'object') continue
+    const message = entry as Record<string, unknown>
+    if (message.role !== 'assistant') continue
+    const text = extractMessageText(message.content)
+    if (text.trim()) return text
+  }
+  const direct =
+    extractMessageText(data.message) || extractMessageText(data.content)
+  return direct.trim() ? direct : ''
+}
+
 function stripDataUrlPrefix(value: string): string {
   const trimmed = value.trim()
   if (!trimmed) return ''
@@ -1263,7 +1309,10 @@ export const Route = createFileRoute('/api/send-stream')({
                       // deltas were missed or response was too short for streaming
                       const content =
                         typeof data.content === 'string' ? data.content : ''
-                      if (content) {
+                      // hermes-jcmm: whitespace-only counts as empty. This is
+                      // a full replace — letting '   ' through wiped both the
+                      // persisted run text and the text already on screen.
+                      if (content.trim()) {
                         persistActiveRun((runSessionKey, activeId) =>
                           appendRunText(runSessionKey, activeId, content, {
                             replace: true,
@@ -1539,6 +1588,10 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'run.completed') {
+                      // hermes-jcmm: last resort for the final answer text —
+                      // filled from the session transcript below when the
+                      // run.completed payload itself carries no text.
+                      let transcriptFinalText = ''
                       // Backfill tool calls from session history.
                       // Hermes Agent currently does not stream tool.* events
                       // reliably, but it persists tool calls on the assistant
@@ -1572,6 +1625,15 @@ export const Route = createFileRoute('/api/send-stream')({
                             liveRunWindow,
                             persistedMessages,
                           )
+                          for (let i = recent.length - 1; i >= 0; i--) {
+                            const m = recent[i]
+                            if (!m || m.role !== 'assistant') continue
+                            const text = extractMessageText(m.content)
+                            if (text.trim()) {
+                              transcriptFinalText = text
+                              break
+                            }
+                          }
                           let lastAssistantIndex = -1
                           for (let i = recent.length - 1; i >= 0; i--) {
                             const m = recent[i]
@@ -1632,6 +1694,27 @@ export const Route = createFileRoute('/api/send-stream')({
                         state: 'complete',
                         sessionKey: sessionKeyFromEvent,
                         runId,
+                      }
+                      // hermes-jcmm: a run could finish with assistantText: ''
+                      // even though the agent's final message had text — no
+                      // assistant.delta arrived and assistant.completed carried
+                      // an empty/blank `content`. Nothing wrote the answer, so
+                      // the history page showed a blank reply for a finished
+                      // run. When no text ever reached the client, take the
+                      // final message off run.completed (its authoritative
+                      // per-turn transcript) or off the session transcript.
+                      // Queued BEFORE markRunStatus: both writes go through the
+                      // run-store queue for this run, so they stay ordered.
+                      if (!resumeText.trim()) {
+                        const finalText =
+                          readFinalAssistantText(data) || transcriptFinalText
+                        if (finalText.trim()) {
+                          persistActiveRun((runSessionKey, activeId) =>
+                            appendRunText(runSessionKey, activeId, finalText, {
+                              replace: true,
+                            }),
+                          )
+                        }
                       }
                       persistActiveRun((runSessionKey, activeId) =>
                         markRunStatus(runSessionKey, activeId, 'complete'),

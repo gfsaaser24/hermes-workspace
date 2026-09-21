@@ -1935,8 +1935,11 @@ function ChatMessageListComponent({
                   forceSimple={!showActivityFeed}
                 />
                 {/* After 10s of thinking, show activity feed. With tool calls:
-                    compact CLI-style TuiActivityCard (last 3). Without tool calls:
-                    a minimal status line showing elapsed time and heartbeat. */}
+                    CLI-style TuiActivityCard listing EVERY tool call of the run
+                    (hermes-jcmm: this used to be capped at the last 3, which hid
+                    long tool chains — the card header summarises "N running ·
+                    M done"). Without tool calls: a minimal status line showing
+                    elapsed time and heartbeat. */}
                 {showActivityFeed ? (
                   <div className="flex max-w-[var(--chat-content-max-width)]">
                     <div
@@ -1950,7 +1953,7 @@ function ChatMessageListComponent({
                     <div className="min-w-0 flex-1 pt-1">
                       {normalizedStreamingToolCalls.length > 0 ? (
                         <TuiActivityCard
-                          toolSections={normalizedStreamingToolCalls.slice(-3).map((tc) => {
+                          toolSections={normalizedStreamingToolCalls.map((tc) => {
                             const phase = tc.phase
                             const state =
                               phase === 'error'

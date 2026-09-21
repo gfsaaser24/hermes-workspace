@@ -25,6 +25,7 @@ import {
   isTerminalActiveRunStatus,
   shouldClearWaitingForAssistantMessage
 } from './chat-screen-utils'
+import { buildNavKey, shouldCancelStreamOnNav } from './nav-cancel'
 import {
   appendHistoryMessage,
   chatQueryKeys,
@@ -1168,6 +1169,16 @@ export function ChatScreen({
             sessionKey,
             friendlyId,
           }
+          // hermes-jcmm: on /chat/new the waiting flag was stored under the
+          // alias key the history hook resolves for a new chat ('main'), so
+          // once the URL became /chat/<id> the real session had no flag
+          // (Stop + thinking gone) and `main` kept a ghost one. Move it.
+          const store = useChatStore.getState()
+          const aliasKey = sessionKeyForWaiting.current
+          if (aliasKey && aliasKey !== sessionKey && isNewChat) {
+            store.clearSessionWaiting(aliasKey)
+          }
+          store.setSessionWaiting(sessionKey)
         }
         if (isNewChat) {
           const modelStore = useSessionModelStore.getState()
@@ -1332,17 +1343,23 @@ export function ChatScreen({
   // the buffered-chunk race, but cancelling here is the cleaner contract
   // (an in-flight response that the user navigated away from is no longer
   // wanted in either session).
+  // hermes-jcmm: the first message of a new chat changes this key too
+  // (/chat/new -> /chat/<id> once the gateway names the session). That is the
+  // stream's OWN session, not a navigation — cancelling there killed the turn
+  // ~5s in (Stop + thinking gone, tool cards only after a reload).
   const navCancelKeyRef = useRef<string | null>(null)
   useEffect(() => {
-    const navKey = `${activeCanonicalKey ?? ''}::${isNewChat ? 'new' : activeFriendlyId}`
-    if (navCancelKeyRef.current === null) {
-      navCancelKeyRef.current = navKey
-      return
-    }
-    if (navCancelKeyRef.current !== navKey) {
-      navCancelKeyRef.current = navKey
-      cancelStreaming()
-    }
+    const navKey = buildNavKey(activeCanonicalKey, isNewChat, activeFriendlyId)
+    const cancel = shouldCancelStreamOnNav({
+      previousNavKey: navCancelKeyRef.current,
+      navKey,
+      isNewChat,
+      activeFriendlyId,
+      activeCanonicalKey,
+      activeSend: activeSendRef.current,
+    })
+    navCancelKeyRef.current = navKey
+    if (cancel) cancelStreaming()
   }, [activeCanonicalKey, activeFriendlyId, isNewChat, cancelStreaming])
 
   const activeIsRealtimeStreaming = isPortableMode
@@ -1600,6 +1617,12 @@ export function ChatScreen({
     activeRealtimeStreamingRef.current = activeIsRealtimeStreaming
   }, [activeIsRealtimeStreaming])
 
+  // hermes-jcmm: "a stream is attached to this run" for the 120s failsafe.
+  const streamAttachedRef = useRef(false)
+  useEffect(() => {
+    streamAttachedRef.current = localIsStreaming || Boolean(resumedRunId)
+  }, [localIsStreaming, resumedRunId])
+
   useEffect(() => {
     if (!waitingForResponse) {
       responseWaitSnapshotRef.current = null
@@ -1620,6 +1643,12 @@ export function ChatScreen({
     }
     const snapshot = responseWaitSnapshotRef.current
     if (!snapshot) return
+    // hermes-jcmm: this is the "no SSE told us the turn ended" fallback. While
+    // a stream is attached (local send or re-attached run) every tool step the
+    // agent takes lands in history as a new assistant row, which this used to
+    // read as "the answer arrived" -> Stop + thinking gone ~1s into the turn.
+    // The attached stream's done/complete path clears waiting instead.
+    if (localIsStreaming || resumedRunId) return
     if (shouldClearWaitingForAssistantMessage(finalDisplayMessages, snapshot)) {
       if (clearTimerRef.current) return
       clearTimerRef.current = window.setTimeout(() => {
@@ -1627,7 +1656,13 @@ export function ChatScreen({
         streamFinish()
       }, 50)
     }
-  }, [finalDisplayMessages, waitingForResponse, streamFinish])
+  }, [
+    finalDisplayMessages,
+    waitingForResponse,
+    streamFinish,
+    localIsStreaming,
+    resumedRunId,
+  ])
 
   useEffect(() => {
     const wasStreaming = prevIsRealtimeStreamingRef.current
@@ -2029,14 +2064,24 @@ export function ChatScreen({
         clientId: optimisticClientId,
       }
 
-      // Failsafe: clear waitingForResponse after 120s no matter what
-      // Prevents infinite spinner if SSE/idle detection both fail
+      // Failsafe: clear waitingForResponse after 120s if SSE/idle detection
+      // both fail. hermes-jcmm: run-aware — while a stream is still attached
+      // the turn is simply long (agent turns run for many minutes), so re-arm
+      // instead of hiding Stop + thinking on a live run.
       if (failsafeTimerRef.current) {
         window.clearTimeout(failsafeTimerRef.current)
       }
-      failsafeTimerRef.current = window.setTimeout(() => {
-        streamFinish()
-      }, 120_000)
+      const armFailsafe = () => {
+        failsafeTimerRef.current = window.setTimeout(() => {
+          failsafeTimerRef.current = null
+          if (streamAttachedRef.current) {
+            armFailsafe()
+            return
+          }
+          streamFinish()
+        }, 120_000)
+      }
+      armFailsafe()
 
       // Send a compatibility shape for attachment parsing.
       // Different server/channel versions read different keys.

@@ -268,13 +268,23 @@ async function readRunsInDir(dir: string): Promise<Array<PersistedRunState>> {
 
 export async function getActiveRunForSession(
   sessionKey: string,
+  options?: {
+    // hermes-jcmm: a run this process still owns (its upstream stream is
+    // open) is alive no matter how long its last write was — a single
+    // long tool call (> 5 min) must stay re-attachable after a reload.
+    isOwned?: (runId: string) => boolean
+  },
 ): Promise<PersistedRunState | null> {
   try {
     const runs = await readRunsInDir(sessionDir(sessionKey))
     const now = Date.now()
+    const isOwned = options?.isOwned ?? (() => false)
     const candidates = runs
       .filter((run) => !TERMINAL_STATUSES.has(run.status))
-      .filter((run) => now - run.updatedAt < STALE_RUN_THRESHOLD_MS)
+      .filter(
+        (run) =>
+          isOwned(run.runId) || now - run.updatedAt < STALE_RUN_THRESHOLD_MS,
+      )
       .sort((a, b) => b.updatedAt - a.updatedAt)
     return candidates[0] ?? null
   } catch {

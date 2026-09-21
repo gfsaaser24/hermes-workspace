@@ -83,3 +83,19 @@ describe('getTrailingToolOnlyTurnSummary', () => {
     expect(summary).toBeNull()
   })
 })
+
+// hermes-jcmm: the live activity card used to render only the LAST 3
+// streaming tool calls (`.slice(-3)`), so a 61-tool run looked like a 3-tool
+// run until the final text arrived. The card lists every call now; the
+// header already summarises "N running · M done".
+describe('live tool activity card', () => {
+  it('does not cap the streaming tool list', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const source = await readFile(
+      new URL('./chat-message-list.tsx', import.meta.url),
+      'utf8',
+    )
+    expect(source).toContain('toolSections={normalizedStreamingToolCalls.map(')
+    expect(source).not.toMatch(/normalizedStreamingToolCalls\.slice\(-\d+\)/)
+  })
+})

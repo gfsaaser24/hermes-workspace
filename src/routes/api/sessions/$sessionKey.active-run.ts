@@ -2,6 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { json } from '@tanstack/react-start'
 import { isAuthenticated } from '../../../server/auth-middleware'
 import { getActiveRunForSession } from '../../../server/run-store'
+import { getRunAbort } from '../../../server/run-stream-bus'
 
 export const Route = createFileRoute('/api/sessions/$sessionKey/active-run')({
   server: {
@@ -20,7 +21,9 @@ export const Route = createFileRoute('/api/sessions/$sessionKey/active-run')({
         }
 
         try {
-          const run = await getActiveRunForSession(sessionKey)
+          const run = await getActiveRunForSession(sessionKey, {
+            isOwned: (runId) => Boolean(getRunAbort(runId)),
+          })
           return json({ ok: true, run })
         } catch (err) {
           return json(

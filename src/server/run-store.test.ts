@@ -57,4 +57,23 @@ describe('run-store persistence', () => {
     expect(stored?.errorMessage).toBeUndefined()
   })
 
+  it('keeps a quiet run re-attachable while this process still owns it', async () => {
+    // A single long tool call writes nothing for > 5 min; the run is still
+    // alive as long as its upstream stream is open in this process.
+    const { createPersistedRun, getActiveRunForSession, markRunStatus } =
+      await import('./run-store')
+    await createPersistedRun({ runId: 'run-long', sessionKey: 'session-1' })
+    await markRunStatus('session-1', 'run-long', 'active')
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(Date.now() + 6 * 60 * 1000)
+      expect(await getActiveRunForSession('session-1')).toBeNull()
+      const owned = await getActiveRunForSession('session-1', {
+        isOwned: (runId) => runId === 'run-long',
+      })
+      expect(owned?.runId).toBe('run-long')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

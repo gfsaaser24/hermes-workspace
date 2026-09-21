@@ -319,10 +319,23 @@ export function toChatMessage(
   }
 }
 
+// hermes-jcmm: the dashboard's `preview` is the first user message cut to a
+// few dozen chars, so the injected `<workspace_context …/>` header (see
+// lib/workspace-message-scope.ts) arrives truncated and unclosed. Drop it
+// however much of it survived; an empty result means "no usable preview".
+const WORKSPACE_DIRECTIVE_PREFIX_RE = /^\s*<workspace_context\b[^>]*(?:>|$)\s*/i
+export function stripWorkspaceDirectivePreview(
+  preview: string | null | undefined,
+): string | undefined {
+  const text = (preview ?? '').replace(WORKSPACE_DIRECTIVE_PREFIX_RE, '').trim()
+  return text || undefined
+}
+
 /** Convert a ClaudeSession to the session summary format the frontend expects */
 export function toSessionSummary(
   session: ClaudeSession,
 ): Record<string, unknown> {
+  const preview = stripWorkspaceDirectivePreview(session.preview)
   return {
     key: session.id,
     friendlyId: session.id,
@@ -331,8 +344,8 @@ export function toSessionSummary(
     model: session.model || '',
     label: session.title || undefined,
     title: session.title || undefined,
-    derivedTitle: session.title || session.preview || undefined,
-    preview: session.preview || undefined,
+    derivedTitle: session.title || preview || undefined,
+    preview,
     tokenCount: (session.input_tokens ?? 0) + (session.output_tokens ?? 0),
     totalTokens: (session.input_tokens ?? 0) + (session.output_tokens ?? 0),
     message_count: session.message_count ?? 0,
