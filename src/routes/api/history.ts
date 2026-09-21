@@ -5,6 +5,7 @@ import {
   ensureGatewayProbed,
   getGatewayCapabilities,
   getMessages,
+  getMessagesWithCompacted,
   listSessions,
   toChatMessage,
   getSession,
@@ -102,7 +103,9 @@ export const Route = createFileRoute('/api/history')({
           }
           let messages: Awaited<ReturnType<typeof getMessages>> = []
           try {
-            messages = await getMessages(sessionKey)
+            // hermes-jcmm: include compacted rows (capped) so a compacted
+            // chat still scrolls back; the summary row becomes a divider.
+            messages = await getMessagesWithCompacted(sessionKey)
           } catch {
             messages = []
           }

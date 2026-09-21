@@ -20,6 +20,7 @@ import {
   forkSession as forkDashboardSession,
   getSession as getDashboardSession,
   getSessionMessages as getDashboardSessionMessages,
+  getSessionMessagesWithCompacted as getDashboardSessionMessagesWithCompacted,
   listSessions as listDashboardSessions,
   searchSessions as searchDashboardSessions,
   updateSession as updateDashboardSession,
@@ -212,6 +213,30 @@ export async function getMessages(
   return resp.items ?? resp.data ?? resp.messages ?? []
 }
 
+// hermes-jcmm: history view — include rows an earlier compaction folded away
+// (capped; the live-run poller keeps using getMessages, the latest page).
+export async function getMessagesWithCompacted(
+  sessionId: string,
+  maxRows = 2000,
+): Promise<Array<ClaudeMessage>> {
+  if (getCapabilities().dashboard.available) {
+    const resp = await getDashboardSessionMessagesWithCompacted(sessionId, maxRows)
+    return resp.messages as Array<ClaudeMessage>
+  }
+  return getMessages(sessionId)
+}
+
+// hermes-jcmm: the row a compaction leaves behind (hermes-lcm `[Recent Summary
+// …]`, stock `[CONTEXT COMPACTION …]`), persisted with role 'user'. Rendered as
+// a divider in the chat, never as something the user typed.
+const COMPACTION_ROW_PREFIXES = ['[Recent Summary', '[CONTEXT COMPACTION']
+export function isCompactionRowText(text: string | null | undefined): boolean {
+  const trimmed = (text ?? '').trimStart()
+  return COMPACTION_ROW_PREFIXES.some((prefix) => trimmed.startsWith(prefix))
+}
+export const COMPACTION_MARKER_TEXT =
+  '[CONTEXT COMPACTION] Older messages were compacted into a summary here.'
+
 export async function searchSessions(
   query: string,
   limit = 20,
@@ -296,15 +321,20 @@ export function toChatMessage(
     })
   }
 
-  if (msg.content && msg.role !== 'tool') {
-    content.push({ type: 'text', text: msg.content })
+  const compactionMarker =
+    msg.role === 'user' && isCompactionRowText(msg.content)
+  const displayText = compactionMarker ? COMPACTION_MARKER_TEXT : msg.content
+
+  if (displayText && msg.role !== 'tool') {
+    content.push({ type: 'text', text: displayText })
   }
 
   return {
     id: `msg-${msg.id}`,
     role: msg.role,
     content,
-    text: msg.content || '',
+    text: displayText || '',
+    ...(compactionMarker ? { __compactionMarker: true } : {}),
     timestamp: msg.timestamp ? msg.timestamp * 1000 : Date.now(),
     createdAt: msg.timestamp
       ? new Date(msg.timestamp * 1000).toISOString()

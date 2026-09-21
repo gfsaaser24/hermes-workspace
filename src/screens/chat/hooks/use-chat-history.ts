@@ -507,6 +507,9 @@ export function useChatHistory({
     const filtered = historyMessages.filter((msg: ChatMessage) => {
       // Always show user messages (unless system events)
       if (msg.role === 'user') {
+        // hermes-jcmm: the compaction summary row is shown as a divider
+        // ("older messages were compacted here"), see chat-message-list.
+        if ((msg as any).__compactionMarker === true) return true
         const text = textFromMessage(msg)
         const execNotification = parseExecNotification(text)
         if (execNotification) {

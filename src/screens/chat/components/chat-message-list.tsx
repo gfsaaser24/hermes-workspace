@@ -768,6 +768,8 @@ function ChatMessageListComponent({
       }
 
       if (msg.role === 'user') {
+        // hermes-jcmm: compaction marker row — always visible, as a divider.
+        if ((msg as any).__compactionMarker === true) return true
         const rawText = (Array.isArray(msg.content) ? msg.content : [])
           .map((part) => (part.type === 'text' ? String(part.text ?? '') : ''))
           .join('')
@@ -1335,6 +1337,26 @@ function ChatMessageListComponent({
   function renderMessage(entry: DisplayEntry, entryIndex: number) {
     const chatMessage = entry.message
     const realIndex = entry.sourceIndex
+    // hermes-jcmm: where a compaction folded older messages into a summary.
+    // The rows above it are the compacted history (still loaded, capped);
+    // the agent's live context starts below it.
+    if ((chatMessage as any).__compactionMarker === true) {
+      return (
+        <div
+          key={getStableMessageId(chatMessage, realIndex)}
+          className="my-6 flex items-center gap-3 px-4 text-[11px] uppercase tracking-wide text-primary-500"
+          role="separator"
+          aria-label="Context compacted here"
+          data-chat-message-id={(chatMessage as any).id}
+        >
+          <div className="h-px flex-1 border-t border-dashed border-primary-300" />
+          <span className="whitespace-nowrap">
+            Context compacted here — older messages are summarized for the agent
+          </span>
+          <div className="h-px flex-1 border-t border-dashed border-primary-300" />
+        </div>
+      )
+    }
     const messageIsStreaming = isMessageStreaming(chatMessage, realIndex)
     const stableId = getStableMessageId(chatMessage, realIndex)
     const signature = streamingState.signatureById.get(stableId)

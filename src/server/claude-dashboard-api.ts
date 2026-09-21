@@ -138,6 +138,35 @@ export async function getSessionMessages(id: string): Promise<{
   return dashboardJson(`/api/sessions/${encodeURIComponent(id)}/messages`)
 }
 
+// hermes-jcmm: after a compaction (hermes-lcm / stock compressor) the plain
+// messages endpoint only returns the LIVE rows — the chat looked cut off at
+// the summary. Ask for the compacted rows too, newest page first, up to
+// `maxRows` (the dashboard pages at 500). Rows come back sorted by id.
+export const DASHBOARD_MESSAGES_PAGE = 500
+export async function getSessionMessagesWithCompacted(
+  id: string,
+  maxRows = 2000,
+): Promise<{ messages: DashboardMessage[] }> {
+  const byId = new Map<number, DashboardMessage>()
+  const rest: DashboardMessage[] = []
+  for (let offset = 0; offset < maxRows; offset += DASHBOARD_MESSAGES_PAGE) {
+    const page = await dashboardJson<{ messages?: DashboardMessage[] }>(
+      `/api/sessions/${encodeURIComponent(id)}/messages?include_compacted=true&order=latest&limit=${DASHBOARD_MESSAGES_PAGE}&offset=${offset}`,
+    )
+    const rows = Array.isArray(page.messages) ? page.messages : []
+    for (const row of rows) {
+      const rowId = Number((row as { id?: unknown }).id)
+      if (Number.isFinite(rowId)) byId.set(rowId, row)
+      else rest.push(row)
+    }
+    if (rows.length < DASHBOARD_MESSAGES_PAGE) break
+  }
+  const messages = [...byId.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, row]) => row)
+  return { messages: [...messages, ...rest] }
+}
+
 export async function searchSessions(q: string): Promise<SessionSearchResponse> {
   return dashboardJson(`/api/sessions/search?q=${encodeURIComponent(q)}`)
 }
