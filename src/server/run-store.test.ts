@@ -45,4 +45,16 @@ describe('run-store persistence', () => {
       events.map((event) => event.text).sort(),
     )
   })
+  it('keeps a user Stop final when the upstream abort reports an error afterwards', async () => {
+    const { createPersistedRun, getPersistedRun, markRunStatus } =
+      await import('./run-store')
+    await createPersistedRun({ runId: 'run-stop', sessionKey: 'session-1' })
+    await markRunStatus('session-1', 'run-stop', 'stopped')
+    // send-stream's catch on the abort we just triggered
+    await markRunStatus('session-1', 'run-stop', 'error', 'This operation was aborted')
+    const stored = await getPersistedRun('session-1', 'run-stop')
+    expect(stored?.status).toBe('stopped')
+    expect(stored?.errorMessage).toBeUndefined()
+  })
+
 })

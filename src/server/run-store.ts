@@ -228,12 +228,18 @@ export async function markRunStatus(
   status: PersistedRunState['status'],
   errorMessage?: string,
 ): Promise<PersistedRunState | null> {
-  return updatePersistedRun(sessionKey, runId, (run) => ({
-    ...run,
-    status,
-    lastEventAt: Date.now(),
-    ...(errorMessage ? { errorMessage } : {}),
-  }))
+  return updatePersistedRun(sessionKey, runId, (run) => {
+    // hermes-jcmm: a user Stop is final. The upstream abort it triggers
+    // reports "This operation was aborted" as an error right after — keep
+    // 'stopped' so the UI does not show a failure the user asked for.
+    if (run.status === 'stopped' && status === 'error') return run
+    return {
+      ...run,
+      status,
+      lastEventAt: Date.now(),
+      ...(errorMessage ? { errorMessage } : {}),
+    }
+  })
 }
 
 // A run that hasn't been touched in this long is considered orphaned (e.g.

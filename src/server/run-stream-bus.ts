@@ -95,7 +95,16 @@ export function publishRunEvent(
     for (const [key, memo] of bus.terminal) {
       if (now - memo.at > TERMINAL_MEMO_TTL_MS) bus.terminal.delete(key)
     }
-    bus.terminal.set(runId, { event: { event, data }, at: now })
+    // hermes-jcmm: a user Stop wins. The upstream abort that Stop triggers
+    // also raises an 'error' terminal a few ms later; do not let it replace
+    // the remembered done{state:'stopped'} a late subscriber should see.
+    const prev = bus.terminal.get(runId)
+    const prevStopped =
+      prev?.event.event === 'done' &&
+      (prev.event.data as { state?: unknown }).state === 'stopped'
+    if (!prevStopped) {
+      bus.terminal.set(runId, { event: { event, data }, at: now })
+    }
   }
   const subscribers = bus.subscribers.get(runId)
   if (!subscribers || subscribers.size === 0) return
