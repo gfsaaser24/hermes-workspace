@@ -18,6 +18,7 @@ import {
 } from '../../server/run-store'
 import {
   RESUME_PUBLISHED_EVENTS,
+  getRunAbort,
   publishRunEvent,
   registerRunAbort,
   unregisterRunAbort,
@@ -48,7 +49,16 @@ import {
 } from './-send-stream-live-tools'
 import type {OpenAICompatContentPart, OpenAICompatMessage} from '../../server/openai-compat-api';
 // Claude agent runs can take 5+ minutes with complex tool chains
-const SEND_STREAM_RUN_TIMEOUT_MS = 600_000
+// hermes-jcmm: the browser no longer bounds a run, so the server does.
+function sendStreamRunTimeoutMs(): number {
+  const raw = Number(process.env.HERMES_RUN_MAX_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 600_000
+}
+// If the agent says nothing at all for this long, abort the upstream fetch.
+function runIdleAbortMs(): number {
+  const raw = Number(process.env.HERMES_RUN_IDLE_ABORT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 900_000
+}
 const SESSION_BOOTSTRAP_KEYS = new Set(['main', 'new'])
 
 function readString(value: unknown): string {
@@ -398,28 +408,39 @@ export const Route = createFileRoute('/api/send-stream')({
         let activeRunSessionKey: string | null = null
         let persistedRunReady: Promise<unknown> | null = null
         let unregisterTimer: ReturnType<typeof setTimeout> | null = null
-        let streamTimeoutTimer: ReturnType<typeof setTimeout> | null = null
+        let idleTimer: ReturnType<typeof setTimeout> | null = null
         let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+        let keepaliveTimer: ReturnType<typeof setInterval> | null = null
+        // Agent-side run id when the gateway reports one. Used only for the
+        // best-effort POST /v1/runs/{id}/stop and chat-event dedup.
+        let agentRunId: string | null = null
         const abortController = new AbortController()
         // Close out the SSE stream — stop enqueueing, clear timers, and
         // abort the upstream Hermes gateway request so the agent stops
         // processing.  Does NOT touch run status (persistActiveRun etc.).
         // The abort path (request.signal / handleAbort) owns run cleanup.
-        let closeStream = () => {
-          if (streamClosed) return
-          streamClosed = true
+        const clearRunTimers = () => {
           if (heartbeatTimer) {
             clearInterval(heartbeatTimer)
             heartbeatTimer = null
+          }
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer)
+            keepaliveTimer = null
           }
           if (unregisterTimer) {
             clearTimeout(unregisterTimer)
             unregisterTimer = null
           }
-          if (streamTimeoutTimer) {
-            clearTimeout(streamTimeoutTimer)
-            streamTimeoutTimer = null
+          if (idleTimer) {
+            clearTimeout(idleTimer)
+            idleTimer = null
           }
+        }
+        let closeStream = () => {
+          if (streamClosed) return
+          streamClosed = true
+          clearRunTimers()
           abortController.abort()
         }
 
@@ -435,6 +456,10 @@ export const Route = createFileRoute('/api/send-stream')({
           if (heartbeatTimer) {
             clearInterval(heartbeatTimer)
             heartbeatTimer = null
+          }
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer)
+            keepaliveTimer = null
           }
         }
         function handleAbort() {
@@ -469,7 +494,6 @@ export const Route = createFileRoute('/api/send-stream')({
 
         const stream = new ReadableStream({
           async start(controller) {
-            let heartbeatTimer: ReturnType<typeof setInterval> | null = null
             let lastClientEventAt = Date.now()
             // Track the last human-readable activity so the heartbeat can
             // forward it to the UI. Without this the ThinkingBubble shows a
@@ -522,7 +546,9 @@ export const Route = createFileRoute('/api/send-stream')({
             // lightweight recognized event periodically so public Workspace chats
             // do not sit at "Thinking…" until the frontend reports failure.
             enqueueRaw(`: ${' '.repeat(2048)}\n\n`)
-            heartbeatTimer = setInterval(() => {
+            // hermes-jcmm: its own handle — this used to be overwritten by
+            // the heartbeat interval below and then leak for good.
+            keepaliveTimer = setInterval(() => {
               if (streamClosed) return
               if (Date.now() - lastClientEventAt < 10_000) return
               // Heartbeat to keep Cloudflare/Access from culling the SSE stream.
@@ -540,6 +566,10 @@ export const Route = createFileRoute('/api/send-stream')({
                 clearInterval(heartbeatTimer)
                 heartbeatTimer = null
               }
+              if (keepaliveTimer) {
+                clearInterval(keepaliveTimer)
+                keepaliveTimer = null
+              }
               try {
                 controller.close()
               } catch {
@@ -550,22 +580,15 @@ export const Route = createFileRoute('/api/send-stream')({
             closeStream = () => {
               if (streamClosed) return
               streamClosed = true
-              if (heartbeatTimer) {
-                clearInterval(heartbeatTimer)
-                heartbeatTimer = null
-              }
-              if (unregisterTimer) {
-                clearTimeout(unregisterTimer)
-                unregisterTimer = null
-              }
-              if (streamTimeoutTimer) {
-                clearTimeout(streamTimeoutTimer)
-                streamTimeoutTimer = null
-              }
+              clearRunTimers()
               if (activeRunId) {
                 unregisterActiveSendRun(activeRunId)
                 unregisterRunAbort(activeRunId)
                 activeRunId = null
+              }
+              if (agentRunId) {
+                unregisterActiveSendRun(agentRunId)
+                agentRunId = null
               }
               abortController.abort()
               try {
@@ -583,6 +606,39 @@ export const Route = createFileRoute('/api/send-stream')({
             heartbeatTimer = setInterval(() => {
               sendEvent('heartbeat', { timestamp: Date.now(), activity: lastActivity })
             }, 10_000)
+
+            // hermes-jcmm: the browser is only a subscriber now, so these
+            // two are the ONLY hard bounds on a run. Both abort the upstream
+            // fetch, mark the run errored, and tell every resumer to stop.
+            const failRun = (reason: 'timeout' | 'idle', message: string) => {
+              if (streamClosed) return
+              persistActiveRun((runSessionKey, activeId) =>
+                markRunStatus(runSessionKey, activeId, 'error', message),
+              )
+              sendEvent('done', {
+                state: 'error',
+                reason,
+                errorMessage: message,
+                sessionKey: activeRunSessionKey ?? sessionKey,
+                runId: activeRunId ?? undefined,
+              })
+              closeStream()
+            }
+            const armRunTimeout = () => {
+              if (unregisterTimer) clearTimeout(unregisterTimer)
+              unregisterTimer = setTimeout(() => {
+                failRun('timeout', 'Run exceeded the maximum duration')
+              }, sendStreamRunTimeoutMs())
+            }
+            // Reset on every byte from the agent. Silence for this long
+            // means the upstream is wedged — nothing else would notice.
+            const touchUpstream = () => {
+              if (streamClosed) return
+              if (idleTimer) clearTimeout(idleTimer)
+              idleTimer = setTimeout(() => {
+                failRun('idle', 'Agent stopped responding')
+              }, runIdleAbortMs())
+            }
 
             try {
               if (chatMode === 'portable') {
@@ -607,13 +663,8 @@ export const Route = createFileRoute('/api/send-stream')({
                   abort: () => abortController.abort(),
                 })
                 persistRunStarted(runId, portableSessionKey, portableFriendlyId)
-                unregisterTimer = setTimeout(() => {
-                  if (activeRunId) {
-                    unregisterActiveSendRun(activeRunId)
-                    unregisterRunAbort(activeRunId)
-                    activeRunId = null
-                  }
-                }, SEND_STREAM_RUN_TIMEOUT_MS)
+                armRunTimeout()
+                touchUpstream()
 
                 sendEvent('started', {
                   runId,
@@ -697,6 +748,7 @@ export const Route = createFileRoute('/api/send-stream')({
                         signal: abortController.signal,
                       })
                       for await (const ev of responsesStream) {
+                        touchUpstream()
                         if (ev.kind === 'text.delta') {
                           accumulated += ev.delta
                           persistActiveRun((runSessionKey, activeId) =>
@@ -842,6 +894,7 @@ export const Route = createFileRoute('/api/send-stream')({
                   let thinking = ''
                   let toolEventCount = 0
                   for await (const chunk of stream) {
+                    touchUpstream()
                     if (chunk.type === 'reasoning') {
                       thinking += chunk.text
                       persistActiveRun((runSessionKey, activeId) =>
@@ -1093,6 +1146,20 @@ export const Route = createFileRoute('/api/send-stream')({
                 }
               })()
 
+              // hermes-jcmm: the gateway may never emit a run_id (older
+              // builds, or a failure before the first event). Own a local
+              // run id from the start so Stop has a handle, the run is
+              // persisted, and a resumer has something to attach to.
+              const localRunId = crypto.randomUUID()
+              activeRunId = localRunId
+              registerActiveSendRun(localRunId)
+              registerRunAbort(localRunId, {
+                abort: () => abortController.abort(),
+              })
+              persistRunStarted(localRunId, sessionKey, resolvedFriendlyId)
+              armRunTimeout()
+              touchUpstream()
+
               try {
                 // hermes-jcmm: make the picked model stateful on the agent side.
                 if (typeof body.model === 'string' && body.model.trim() && !localBaseUrl) {
@@ -1115,33 +1182,22 @@ export const Route = createFileRoute('/api/send-stream')({
                       data.session_id.trim()
                         ? data.session_id
                         : sessionKey
-                    const runId =
+                    touchUpstream()
+                    // hermes-jcmm: the Workspace run id (localRunId) is the
+                    // stable identity for run-store, the bus and the client.
+                    // The agent's own run_id is metadata: it feeds the
+                    // chat-events dedup and POST /v1/runs/{id}/stop.
+                    const eventRunId =
                       typeof data.run_id === 'string' && data.run_id.trim()
-                        ? data.run_id
-                        : (activeRunId ?? undefined)
-
-                    if (runId && !activeRunId) {
-                      activeRunId = runId
-                      registerActiveSendRun(runId)
-                      // hermes-jcmm: see the portable path — this is the only
-                      // way an explicit Stop can reach the agent fetch.
-                      registerRunAbort(runId, {
-                        abort: () => abortController.abort(),
-                        agentRunId: runId,
-                      })
-                      persistRunStarted(
-                        runId,
-                        sessionKeyFromEvent,
-                        sessionKeyFromEvent,
-                      )
-                      unregisterTimer = setTimeout(() => {
-                        if (activeRunId) {
-                          unregisterActiveSendRun(activeRunId)
-                          unregisterRunAbort(activeRunId)
-                          activeRunId = null
-                        }
-                      }, SEND_STREAM_RUN_TIMEOUT_MS)
+                        ? data.run_id.trim()
+                        : ''
+                    if (eventRunId && eventRunId !== agentRunId) {
+                      agentRunId = eventRunId
+                      registerActiveSendRun(eventRunId)
+                      const handle = getRunAbort(localRunId)
+                      if (handle) handle.agentRunId = eventRunId
                     }
+                    const runId = activeRunId ?? localRunId
 
                     if (!startedSent && runId) {
                       startedSent = true
@@ -1597,13 +1653,12 @@ export const Route = createFileRoute('/api/send-stream')({
                 }
               }
 
-              // Set a timeout to close the stream if no completion event
-              streamTimeoutTimer = setTimeout(() => {
-                if (!streamClosed) {
-                  sendEvent('error', { message: 'Stream timeout' })
-                  closeStream()
-                }
-              }, SEND_STREAM_RUN_TIMEOUT_MS)
+              // hermes-jcmm: the upstream stream ended without run.completed.
+              // This used to arm a 600s timer that could not bound anything
+              // (the read was already over) and kept the handler alive.
+              if (!streamClosed) {
+                failRun('idle', 'Agent closed the stream before completing')
+              }
             } catch (err) {
               // Only send error if stream hasn't already completed successfully
               if (!streamClosed) {

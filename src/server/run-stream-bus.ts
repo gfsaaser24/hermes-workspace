@@ -34,6 +34,8 @@ export type RunAbortHandle = {
 type RunStreamBusState = {
   subscribers: Map<string, Set<RunStreamSubscriber>>
   aborts: Map<string, RunAbortHandle>
+  /** Last terminal event per run, so a LATE subscriber still gets told. */
+  terminal: Map<string, { event: RunStreamEvent; at: number }>
 }
 
 function getBus(): RunStreamBusState {
@@ -42,6 +44,7 @@ function getBus(): RunStreamBusState {
     host[BUS_KEY] = {
       subscribers: new Map<string, Set<RunStreamSubscriber>>(),
       aborts: new Map<string, RunAbortHandle>(),
+      terminal: new Map<string, { event: RunStreamEvent; at: number }>(),
     } satisfies RunStreamBusState
   }
   return host[BUS_KEY] as RunStreamBusState
@@ -75,13 +78,26 @@ export const RESUME_PUBLISHED_EVENTS: ReadonlySet<string> = new Set([
   'error',
 ])
 
+const TERMINAL_MEMO_TTL_MS = 10 * 60 * 1000
+
 export function publishRunEvent(
   runId: string,
   event: string,
   data: Record<string, unknown>,
 ): void {
   if (!runId) return
-  const subscribers = getBus().subscribers.get(runId)
+  const bus = getBus()
+  if (event === 'done' || event === 'error') {
+    // Remember it even with zero subscribers — a tab that attaches a second
+    // later must still be told the run is over instead of hanging on
+    // keepalives.
+    const now = Date.now()
+    for (const [key, memo] of bus.terminal) {
+      if (now - memo.at > TERMINAL_MEMO_TTL_MS) bus.terminal.delete(key)
+    }
+    bus.terminal.set(runId, { event: { event, data }, at: now })
+  }
+  const subscribers = bus.subscribers.get(runId)
   if (!subscribers || subscribers.size === 0) return
   for (const subscriber of subscribers) {
     try {
@@ -111,6 +127,17 @@ export function subscribeToRunStream(
   }
 }
 
+/** The terminal event a run already published, if it is still remembered. */
+export function getRunTerminalEvent(runId: string): RunStreamEvent | null {
+  const memo = getBus().terminal.get(runId)
+  if (!memo) return null
+  if (Date.now() - memo.at > TERMINAL_MEMO_TTL_MS) {
+    getBus().terminal.delete(runId)
+    return null
+  }
+  return memo.event
+}
+
 export function runStreamSubscriberCount(runId: string): number {
   return getBus().subscribers.get(runId)?.size ?? 0
 }
@@ -119,4 +146,5 @@ export function runStreamSubscriberCount(runId: string): number {
 export function clearRunStreamBus(): void {
   getBus().subscribers.clear()
   getBus().aborts.clear()
+  getBus().terminal.clear()
 }

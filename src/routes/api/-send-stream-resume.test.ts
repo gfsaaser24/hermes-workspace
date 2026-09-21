@@ -117,7 +117,10 @@ function startFakeGateway(): Promise<string> {
       Connection: 'keep-alive',
     })
     void (async () => {
-      const base = { run_id: RUN, session_id: SESSION }
+      const base: Record<string, unknown> =
+        process.env.HERMES_FAKE_NO_RUN_ID === '1'
+          ? { session_id: SESSION }
+          : { run_id: RUN, session_id: SESSION }
       res.write(sse('run.started', { ...base }))
       await new Promise((r) => setTimeout(r, 10))
       res.write(
@@ -217,6 +220,11 @@ async function waitFor(check: () => boolean, budgetMs = 3000): Promise<void> {
   }
 }
 
+function runIdOf(events: Array<ParsedEvent>): string {
+  const started = events.find((e) => e.event === 'started')
+  return String(started?.data.runId ?? '')
+}
+
 beforeAll(async () => {
   hoisted.baseUrl = await startFakeGateway()
 })
@@ -285,7 +293,9 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
     await new Promise((r) => setTimeout(r, 50))
 
     // The run must still be live — not flipped to a terminal state.
-    const midRun = await runStore.getPersistedRun(SESSION, RUN)
+    const workspaceRunId = runIdOf(seen)
+    expect(workspaceRunId).not.toBe('')
+    const midRun = await runStore.getPersistedRun(SESSION, workspaceRunId)
     expect(midRun).toBeTruthy()
     expect(['accepted', 'active']).toContain(midRun!.status)
 
@@ -293,7 +303,7 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
     const resumeHandlers = (resumeRoute as any).Route.options.server.handlers
     const resumeResponse = (await resumeHandlers.GET({
       request: new Request('http://localhost/api/runs/x/y/stream'),
-      params: { sessionKey: SESSION, runId: RUN },
+      params: { sessionKey: SESSION, runId: workspaceRunId },
     })) as Response
     expect(resumeResponse.status).toBe(200)
 
@@ -329,10 +339,10 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
     expect(gate.aborted).toBe(false)
 
     // run-store writes are fire-and-forget behind a queue; give them a beat.
-    let finalRun = await runStore.getPersistedRun(SESSION, RUN)
+    let finalRun = await runStore.getPersistedRun(SESSION, workspaceRunId)
     for (let i = 0; i < 40 && finalRun?.status !== 'complete'; i++) {
       await new Promise((r) => setTimeout(r, 25))
-      finalRun = await runStore.getPersistedRun(SESSION, RUN)
+      finalRun = await runStore.getPersistedRun(SESSION, workspaceRunId)
     }
     expect(finalRun?.status).toBe('complete')
     expect(finalRun?.assistantText).toBe('The full answer.')
@@ -364,13 +374,14 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
         break
       }
     }
-    expect(seen.some((e) => e.event === 'started')).toBe(true)
+    const workspaceRunId = runIdOf(seen)
+    expect(workspaceRunId).not.toBe('')
 
     // Another tab is watching the run when Stop is pressed.
     const resumeHandlers = (resumeRoute as any).Route.options.server.handlers
     const resumeResponse = (await resumeHandlers.GET({
       request: new Request('http://localhost/api/runs/x/y/stream'),
-      params: { sessionKey: SESSION, runId: RUN },
+      params: { sessionKey: SESSION, runId: workspaceRunId },
     })) as Response
     const resumed = readUntil(resumeResponse, (evts) =>
       evts.some((e) => e.event === 'done'),
@@ -383,7 +394,7 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
       request: new Request('http://localhost/api/runs/x/y/abandon', {
         method: 'POST',
       }),
-      params: { sessionKey: SESSION, runId: RUN },
+      params: { sessionKey: SESSION, runId: workspaceRunId },
     })) as Response
     expect(stopRes.status).toBe(200)
     const stopBody = (await stopRes.json()) as Record<string, unknown>
@@ -399,7 +410,7 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
     const done = events.find((e) => e.event === 'done')
     expect(done?.data.state).toBe('stopped')
 
-    const run = await runStore.getPersistedRun(SESSION, RUN)
+    const run = await runStore.getPersistedRun(SESSION, workspaceRunId)
     expect(run?.status).toBe('stopped')
 
     // Idempotent: a second Stop is still a success, and no run re-attaches.
@@ -407,11 +418,128 @@ describe('send-stream survives the browser disconnecting mid-run', () => {
       request: new Request('http://localhost/api/runs/x/y/abandon', {
         method: 'POST',
       }),
-      params: { sessionKey: SESSION, runId: RUN },
+      params: { sessionKey: SESSION, runId: workspaceRunId },
     })) as Response
     expect(second.status).toBe(200)
     expect(((await second.json()) as Record<string, unknown>).ok).toBe(true)
-    expect(await runStore.getActiveRunForSession(SESSION)).toBeNull()
+    expect(
+      (await runStore.getPersistedRun(SESSION, workspaceRunId))?.status,
+    ).toBe('stopped')
+
+    await reader.cancel().catch(() => undefined)
+    gate.release()
+  }, 20000)
+
+  it('aborts the upstream fetch and errors the run when the agent goes silent', async () => {
+    process.env.HERMES_RUN_IDLE_ABORT_MS = '150'
+    const sendStream = await import('./send-stream')
+    const runStore = await import('../../server/run-store')
+
+    const handlers = (sendStream as any).Route.options.server.handlers
+    const response = (await handlers.POST({
+      request: new Request('http://localhost/api/send-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionKey: SESSION, message: 'go' }),
+      }),
+    })) as Response
+
+    const events = await readUntil(response, (evts) =>
+      evts.some((e) => e.event === 'done' || e.event === 'error'),
+    )
+    const done = events.find((e) => e.event === 'done')
+    expect(done?.data.state).toBe('error')
+    expect(done?.data.reason).toBe('idle')
+
+    await waitFor(() => gate.aborted)
+    expect(gate.aborted).toBe(true)
+
+    const runId = String(
+      events.find((e) => e.event === 'started')?.data.runId ?? '',
+    )
+    expect(runId).not.toBe('')
+    let run = await runStore.getPersistedRun(SESSION, runId)
+    for (let i = 0; i < 40 && run?.status !== 'error'; i++) {
+      await new Promise((r) => setTimeout(r, 25))
+      run = await runStore.getPersistedRun(SESSION, runId)
+    }
+    expect(run?.status).toBe('error')
+    gate.release()
+  }, 20000)
+
+  it('hard-stops a run that outlives the maximum duration', async () => {
+    process.env.HERMES_RUN_MAX_MS = '150'
+    const sendStream = await import('./send-stream')
+    const runStore = await import('../../server/run-store')
+
+    const handlers = (sendStream as any).Route.options.server.handlers
+    const response = (await handlers.POST({
+      request: new Request('http://localhost/api/send-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionKey: SESSION, message: 'go' }),
+      }),
+    })) as Response
+
+    const events = await readUntil(response, (evts) =>
+      evts.some((e) => e.event === 'done'),
+    )
+    const done = events.find((e) => e.event === 'done')
+    expect(done?.data.state).toBe('error')
+    expect(done?.data.reason).toBe('timeout')
+
+    await waitFor(() => gate.aborted)
+    expect(gate.aborted).toBe(true)
+
+    const runId = String(
+      events.find((e) => e.event === 'started')?.data.runId ?? '',
+    )
+    let run = await runStore.getPersistedRun(SESSION, runId)
+    for (let i = 0; i < 40 && run?.status !== 'error'; i++) {
+      await new Promise((r) => setTimeout(r, 25))
+      run = await runStore.getPersistedRun(SESSION, runId)
+    }
+    expect(run?.status).toBe('error')
+    gate.release()
+  }, 20000)
+
+  it('still registers an abort handle when the agent never sends run_id', async () => {
+    process.env.HERMES_FAKE_NO_RUN_ID = '1'
+    const sendStream = await import('./send-stream')
+    const bus = await import('../../server/run-stream-bus')
+    const runStore = await import('../../server/run-store')
+
+    const handlers = (sendStream as any).Route.options.server.handlers
+    const response = (await handlers.POST({
+      request: new Request('http://localhost/api/send-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionKey: SESSION, message: 'go' }),
+      }),
+    })) as Response
+
+    const reader = response.body!.getReader()
+    const parse = createSseParser()
+    const seen: Array<ParsedEvent> = []
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      const { done, value } = await reader.read()
+      if (done) break
+      seen.push(...parse(value))
+      if (seen.some((e) => e.event === 'started')) break
+    }
+    const runId = String(
+      seen.find((e) => e.event === 'started')?.data.runId ?? '',
+    )
+    expect(runId).not.toBe('')
+    // Stop works even though the gateway told us nothing about the run.
+    expect(bus.getRunAbort(runId)).toBeTruthy()
+    let persisted = await runStore.getPersistedRun(SESSION, runId)
+    for (let i = 0; i < 40 && !persisted; i++) {
+      await new Promise((r) => setTimeout(r, 25))
+      persisted = await runStore.getPersistedRun(SESSION, runId)
+    }
+    expect(persisted).toBeTruthy()
 
     await reader.cancel().catch(() => undefined)
     gate.release()

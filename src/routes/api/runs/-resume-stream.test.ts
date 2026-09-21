@@ -25,6 +25,7 @@ beforeEach(() => {
   process.env.HERMES_RUN_RESUME_HEARTBEAT_MS = '25'
   process.env.HERMES_RUN_RESUME_POLL_MS = '20'
   process.env.HERMES_RUN_RESUME_STALL_MS = '100000'
+  process.env.HERMES_RUN_RESUME_ORPHAN_MS = '100000'
 })
 
 afterEach(() => {
@@ -192,6 +193,7 @@ describe('run resume stream route', () => {
 
   it('ends the stream when the persisted run stops advancing', async () => {
     process.env.HERMES_RUN_RESUME_STALL_MS = '0'
+    process.env.HERMES_RUN_RESUME_ORPHAN_MS = '0'
     const store = await import('../../../server/run-store')
     await store.createPersistedRun({ runId: 'r4', sessionKey: 's4' })
 
@@ -201,5 +203,58 @@ describe('run resume stream route', () => {
     )
     const done = events.find((e) => e.event === 'done')
     expect(done?.data.state).toBe('stalled')
+  })
+
+  it('never calls a run stalled while its owner request is still alive', async () => {
+    process.env.HERMES_RUN_RESUME_STALL_MS = '0'
+    process.env.HERMES_RUN_RESUME_ORPHAN_MS = '0'
+    const store = await import('../../../server/run-store')
+    const bus = await import('../../../server/run-stream-bus')
+    await store.createPersistedRun({ runId: 'r5', sessionKey: 's5' })
+    bus.registerRunAbort('r5', { abort: () => undefined })
+
+    const res = await callStream('s5', 'r5')
+    const { events } = await readEvents(
+      res,
+      (evts) => evts.filter((e) => e.event === 'heartbeat').length >= 2,
+    )
+    expect(events.some((e) => e.event === 'done')).toBe(false)
+    bus.unregisterRunAbort('r5')
+  })
+
+  it('closes immediately when the run was stopped before we subscribed', async () => {
+    const store = await import('../../../server/run-store')
+    await store.createPersistedRun({ runId: 'r6', sessionKey: 's6' })
+    await store.appendRunText('s6', 'r6', 'half an answer')
+    await store.markRunStatus('s6', 'r6', 'stopped', 'Stopped by user')
+
+    const started = Date.now()
+    const res = await callStream('s6', 'r6')
+    const { events } = await readEvents(res, (evts) =>
+      evts.some((e) => e.event === 'done'),
+    )
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(events.find((e) => e.event === 'done')?.data.state).toBe('stopped')
+  })
+
+  it('terminates when the bus already published done before we subscribed', async () => {
+    const store = await import('../../../server/run-store')
+    const bus = await import('../../../server/run-stream-bus')
+    // Persisted state still says 'active' — only the bus knows it ended.
+    await store.createPersistedRun({ runId: 'r7', sessionKey: 's7' })
+    bus.publishRunEvent('r7', 'done', {
+      sessionKey: 's7',
+      runId: 'r7',
+      state: 'stopped',
+    })
+
+    const started = Date.now()
+    const res = await callStream('s7', 'r7')
+    const { events } = await readEvents(res, (evts) =>
+      evts.some((e) => e.event === 'done'),
+    )
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(events.find((e) => e.event === 'done')?.data.state).toBe('stopped')
+    bus.clearRunStreamBus()
   })
 })

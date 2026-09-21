@@ -43,6 +43,12 @@ export type PersistedRunState = {
   errorMessage?: string
 }
 
+const TERMINAL_STATUSES: ReadonlySet<PersistedRunState['status']> = new Set([
+  'complete',
+  'error',
+  'stopped',
+])
+
 const RUNS_ROOT = path.join(getHermesRoot(), 'webui-mvp', 'runs')
 const runUpdateQueues = new Map<string, Promise<void>>()
 
@@ -55,7 +61,9 @@ function sessionDir(sessionKey: string): string {
 }
 
 function runPath(sessionKey: string, runId: string): string {
-  return path.join(sessionDir(sessionKey), `${runId}.json`)
+  // hermes-jcmm: runId reaches this from a URL param — encode it so a
+  // '../..' id cannot escape the session directory.
+  return path.join(sessionDir(sessionKey), `${encodeURIComponent(runId)}.json`)
 }
 
 async function ensureDir(dir: string): Promise<void> {
@@ -145,6 +153,13 @@ export async function updatePersistedRun(
   })
 }
 
+// hermes-jcmm: a write queued before a Stop must never resurrect the run.
+function keepTerminal(
+  status: PersistedRunState['status'],
+): PersistedRunState['status'] {
+  return TERMINAL_STATUSES.has(status) ? status : 'active'
+}
+
 export async function appendRunText(
   sessionKey: string,
   runId: string,
@@ -153,7 +168,7 @@ export async function appendRunText(
 ): Promise<PersistedRunState | null> {
   return updatePersistedRun(sessionKey, runId, (run) => ({
     ...run,
-    status: 'active',
+    status: keepTerminal(run.status),
     lastEventAt: Date.now(),
     assistantText: options?.replace ? text : `${run.assistantText}${text}`,
   }))
@@ -166,7 +181,7 @@ export async function setRunThinking(
 ): Promise<PersistedRunState | null> {
   return updatePersistedRun(sessionKey, runId, (run) => ({
     ...run,
-    status: 'active',
+    status: keepTerminal(run.status),
     lastEventAt: Date.now(),
     thinkingText,
   }))
@@ -184,7 +199,8 @@ export async function upsertRunToolCall(
     else nextToolCalls.push(toolCall)
     return {
       ...run,
-      status: toolCall.phase === 'error' ? 'error' : 'active',
+      status:
+        toolCall.phase === 'error' ? 'error' : keepTerminal(run.status),
       lastEventAt: Date.now(),
       toolCalls: nextToolCalls,
       ...(toolCall.phase === 'error' && toolCall.result
@@ -227,11 +243,6 @@ export async function markRunStatus(
 // until the 120s client-side failsafe clears it.
 const STALE_RUN_THRESHOLD_MS = 5 * 60 * 1000
 
-const TERMINAL_STATUSES: ReadonlySet<PersistedRunState['status']> = new Set([
-  'complete',
-  'error',
-  'stopped',
-])
 
 async function readRunsInDir(dir: string): Promise<Array<PersistedRunState>> {
   const files = (await readdir(dir)).filter((name) => name.endsWith('.json'))

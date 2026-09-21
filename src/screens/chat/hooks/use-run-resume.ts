@@ -23,7 +23,10 @@ const RESUMABLE_RUN_STATUSES: ReadonlySet<string> = new Set([
   'stalled',
 ])
 
-export type ResumeOutcome = 'open' | 'done' | 'error'
+export type ResumeOutcome = 'open' | 'done' | 'error' | 'stalled'
+
+/** How long to wait before re-attaching to a run the server called stalled. */
+export const RESUME_RETRY_MS = 30_000
 
 function readString(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -123,6 +126,10 @@ export function applyResumeEvent({
 
     case 'done': {
       const state = readString(data.state) || 'complete'
+      // hermes-jcmm: 'stalled' is a guess, not an answer. Finalising here
+      // would turn half-written text into a completed reply. Leave the
+      // streaming row alone and let the caller re-attach.
+      if (state === 'stalled') return 'stalled'
       processEvent({
         type: 'done',
         state,
@@ -184,8 +191,13 @@ export function useRunResume({
   enabled: boolean
   isLocalStreamActive: boolean
   onRunComplete?: () => void
-}): { resumedRunId: string | null; stopResumedRun: () => void } {
+}): {
+  resumedRunId: string | null
+  resumeStalled: boolean
+  stopResumedRun: () => void
+} {
   const [resumedRunId, setResumedRunId] = useState<string | null>(null)
+  const [resumeStalled, setResumeStalled] = useState(false)
 
   const sessionKeyRef = useRef(sessionKey)
   sessionKeyRef.current = sessionKey
@@ -197,15 +209,27 @@ export function useRunResume({
   onRunCompleteRef.current = onRunComplete
   const attachedRunIdRef = useRef<string | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearRetry = useCallback(() => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = null
+    }
+  }, [])
 
   const detach = useCallback(() => {
+    clearRetry()
     attachedRunIdRef.current = null
     if (controllerRef.current) {
       controllerRef.current.abort()
       controllerRef.current = null
     }
     setResumedRunId(null)
-  }, [])
+    setResumeStalled(false)
+  }, [clearRetry])
+
+  const checkRef = useRef<() => void>(() => undefined)
 
   const attach = useCallback(async (key: string, runId: string) => {
     if (attachedRunIdRef.current) return
@@ -213,10 +237,12 @@ export function useRunResume({
     const controller = new AbortController()
     controllerRef.current = controller
     setResumedRunId(runId)
+    setResumeStalled(false)
 
     const store = useChatStore.getState()
     store.setSessionWaiting(key, runId)
 
+    let outcome: ResumeOutcome = 'open'
     try {
       const response = await fetch(
         `/api/runs/${encodeURIComponent(key)}/${encodeURIComponent(runId)}/stream`,
@@ -229,7 +255,6 @@ export function useRunResume({
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-      let outcome: ResumeOutcome = 'open'
 
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime safety
       while (true) {
@@ -264,21 +289,43 @@ export function useRunResume({
         }
         if (outcome !== 'open') break
       }
+      // Stop reading; the server may still be holding the socket open.
+      controller.abort()
 
-      useChatStore.getState().clearSessionWaiting(key)
-      onRunCompleteRef.current?.()
+      if (outcome === 'stalled') {
+        // The server lost sight of the run but never said it finished. Hold
+        // the waiting state and the banner, and try again shortly.
+        if (controllerRef.current === controller) {
+          setResumeStalled(true)
+          clearRetry()
+          retryTimerRef.current = setTimeout(() => {
+            retryTimerRef.current = null
+            checkRef.current()
+          }, RESUME_RETRY_MS)
+        }
+        return
+      }
+      if (controllerRef.current === controller) {
+        useChatStore.getState().clearSessionWaiting(key)
+        onRunCompleteRef.current?.()
+      }
     } catch {
-      // Network error / abort — drop the waiting state so the UI never sits
-      // on a dead spinner. A later focus event retries.
-      if (!controller.signal.aborted) {
+      // Network error — drop the waiting state so the UI never sits on a dead
+      // spinner. Never touch it after an abort or a session switch: that run
+      // (and another session's state) is not ours to clear.
+      if (!controller.signal.aborted && sessionKeyRef.current === key) {
         useChatStore.getState().clearSessionWaiting(key)
       }
     } finally {
-      if (controllerRef.current === controller) controllerRef.current = null
-      attachedRunIdRef.current = null
-      setResumedRunId(null)
+      // Identity guard: a session switch may already have started a new
+      // attachment, and clearing these outside the guard clobbered it.
+      if (controllerRef.current === controller) {
+        controllerRef.current = null
+        attachedRunIdRef.current = null
+        if (outcome !== 'stalled') setResumedRunId(null)
+      }
     }
-  }, [])
+  }, [clearRetry])
 
   const checkForActiveRun = useCallback(async () => {
     const key = sessionKeyRef.current
@@ -303,6 +350,10 @@ export function useRunResume({
       // ignore — a focus event will retry
     }
   }, [attach])
+
+  checkRef.current = () => {
+    void checkForActiveRun()
+  }
 
   useEffect(() => {
     detach()
@@ -329,6 +380,10 @@ export function useRunResume({
 
   useEffect(() => {
     return () => {
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
       if (controllerRef.current) {
         controllerRef.current.abort()
         controllerRef.current = null
@@ -338,11 +393,11 @@ export function useRunResume({
   }, [])
 
   const stopResumedRun = useCallback(() => {
-    const runId = attachedRunIdRef.current
+    const runId = attachedRunIdRef.current ?? resumedRunId
     const key = sessionKeyRef.current
     if (!runId || !key) return
     void requestRunStop(key, runId)
-  }, [])
+  }, [resumedRunId])
 
-  return { resumedRunId, stopResumedRun }
+  return { resumedRunId, resumeStalled, stopResumedRun }
 }

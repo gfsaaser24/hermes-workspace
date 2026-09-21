@@ -9,7 +9,11 @@ import {
   getRunResumeConfig,
   isRunStalled,
 } from '../../../server/run-resume'
-import { subscribeToRunStream } from '../../../server/run-stream-bus'
+import {
+  getRunAbort,
+  getRunTerminalEvent,
+  subscribeToRunStream,
+} from '../../../server/run-stream-bus'
 import type { RunStreamEvent } from '../../../server/run-stream-bus'
 
 /**
@@ -126,6 +130,16 @@ export const Route = createFileRoute('/api/runs/$sessionKey/$runId/stream')({
               sendEvent(replay.event, replay.data)
             }
             if (TERMINAL_RUN_STATUSES.has(snapshot.status)) {
+              // buildRunReplayEvents already appended the terminal event.
+              closeStream()
+              return
+            }
+            // hermes-jcmm: the run may have ended between the last persisted
+            // write and now (e.g. Stop published done before we subscribed).
+            // Without this the stream sat on keepalives until the stall window.
+            const alreadyDone = getRunTerminalEvent(runId)
+            if (alreadyDone) {
+              sendEvent(alreadyDone.event, alreadyDone.data)
               closeStream()
               return
             }
@@ -161,7 +175,12 @@ export const Route = createFileRoute('/api/runs/$sessionKey/$runId/stream')({
                   closeStream()
                   return
                 }
-                if (isRunStalled(current, Date.now(), config.stallMs)) {
+                // A live owner request means the agent is still being read,
+                // so silence is not a stall. With no owner in this process the
+                // run is almost certainly orphaned — give up much sooner.
+                const ownerAlive = Boolean(getRunAbort(runId))
+                const window = ownerAlive ? config.stallMs : config.orphanMs
+                if (isRunStalled(current, Date.now(), window, ownerAlive)) {
                   sendEvent('done', {
                     sessionKey,
                     runId,

@@ -96,6 +96,16 @@ describe('applyResumeEvent', () => {
     expect(JSON.stringify(messages[0].content)).toContain('Final answer')
   })
 
+  it('never finalises a stalled run — partial text must not become an answer', () => {
+    hydrate('chunk', { text: 'Half an ans', fullReplace: true })
+    expect(hydrate('done', { state: 'stalled' })).toBe('stalled')
+
+    // Streaming state survives, and nothing was committed to history.
+    const streaming = useChatStore.getState().getStreamingState(SESSION)
+    expect(streaming?.text).toBe('Half an ans')
+    expect(useChatStore.getState().getRealtimeMessages(SESSION)).toHaveLength(0)
+  })
+
   it('reports error outcomes so the caller can drop the waiting state', () => {
     expect(hydrate('error', { message: 'nope' })).toBe('error')
     expect(hydrate('done', { state: 'error', errorMessage: 'nope' })).toBe(

@@ -1312,7 +1312,7 @@ export function ChatScreen({
   // hermes-jcmm: re-attach to a run that is still executing server-side after
   // a reload / tab switch / dropped SSE. Replays the tool cards + text so far,
   // then tails the live run. Only runs when no local send-stream is attached.
-  const { resumedRunId, stopResumedRun } = useRunResume({
+  const { resumedRunId, resumeStalled, stopResumedRun } = useRunResume({
     sessionKey: resolvedSessionKey || '',
     enabled: !isNewChat && Boolean(resolvedSessionKey),
     isLocalStreamActive: localIsStreaming || sending,
@@ -2876,7 +2876,11 @@ export function ChatScreen({
               data-testid="run-resume-notice"
             >
               <span className="size-2 animate-pulse rounded-full bg-sky-500" />
-              <span>Reconnected — agent still working</span>
+              <span>
+                {resumeStalled
+                  ? 'Still working — waiting for the agent'
+                  : 'Reconnected — agent still working'}
+              </span>
               <button
                 type="button"
                 className="ml-auto rounded-lg border border-sky-300 px-2 py-0.5 text-xs font-medium hover:bg-sky-100 dark:border-sky-700 dark:hover:bg-sky-900/40"

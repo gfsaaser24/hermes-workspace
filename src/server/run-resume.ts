@@ -40,8 +40,13 @@ export type RunResumeConfig = {
   heartbeatMs: number
   /** How often the resume stream re-reads the persisted run. */
   pollMs: number
-  /** No persisted progress for this long → the run is declared stalled. */
+  /**
+   * No persisted progress for this long AND no live owner → stalled.
+   * Long tool calls can be silent for many minutes, so this is generous.
+   */
   stallMs: number
+  /** No owner request in this process → the run is orphaned this much sooner. */
+  orphanMs: number
   /** Grace before reading the snapshot, so in-flight disk writes land first. */
   settleMs: number
 }
@@ -50,7 +55,8 @@ export function getRunResumeConfig(): RunResumeConfig {
   return {
     heartbeatMs: envMs('HERMES_RUN_RESUME_HEARTBEAT_MS', 10_000),
     pollMs: envMs('HERMES_RUN_RESUME_POLL_MS', 5_000),
-    stallMs: envMs('HERMES_RUN_RESUME_STALL_MS', 120_000),
+    stallMs: envMs('HERMES_RUN_RESUME_STALL_MS', 900_000),
+    orphanMs: envMs('HERMES_RUN_RESUME_ORPHAN_MS', 60_000),
     settleMs: envMs('HERMES_RUN_RESUME_SETTLE_MS', 60),
   }
 }
@@ -143,12 +149,19 @@ export function buildRunTerminalEvent(run: PersistedRunState): ResumeSseEvent {
   return { event: 'done', data: { ...base, state: 'complete' } }
 }
 
-/** A run whose persisted state stopped advancing is no longer worth tailing. */
+/**
+ * A run whose persisted state stopped advancing is no longer worth tailing —
+ * UNLESS the request that owns it is still alive (ownerAlive). A silent tool
+ * call is not a stall, and calling it one made the client finalise partial
+ * text as if it were the answer.
+ */
 export function isRunStalled(
   run: PersistedRunState,
   now: number,
   stallMs: number,
+  ownerAlive = false,
 ): boolean {
   if (TERMINAL_RUN_STATUSES.has(run.status)) return false
+  if (ownerAlive) return false
   return now - Math.max(run.updatedAt, run.lastEventAt) > stallMs
 }
