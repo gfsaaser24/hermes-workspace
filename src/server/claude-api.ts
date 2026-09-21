@@ -5,6 +5,7 @@
  * Replaces legacy WebSocket connection for the Hermes Workspace fork.
  */
 
+import { parseCompactionNode } from './lcm-stats'
 import {
   BEARER_TOKEN,
   CLAUDE_API,
@@ -334,7 +335,12 @@ export function toChatMessage(
     role: msg.role,
     content,
     text: displayText || '',
-    ...(compactionMarker ? { __compactionMarker: true } : {}),
+    ...(compactionMarker
+      ? {
+          __compactionMarker: true,
+          __compactionNode: parseCompactionNode(msg.content),
+        }
+      : {}),
     timestamp: msg.timestamp ? msg.timestamp * 1000 : Date.now(),
     createdAt: msg.timestamp
       ? new Date(msg.timestamp * 1000).toISOString()

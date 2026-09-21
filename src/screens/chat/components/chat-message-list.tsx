@@ -1341,6 +1341,35 @@ function ChatMessageListComponent({
     // The rows above it are the compacted history (still loaded, capped);
     // the agent's live context starts below it.
     if ((chatMessage as any).__compactionMarker === true) {
+      const stats = (chatMessage as any).__compaction as
+        | {
+            messages?: number
+            sourceTokens?: number
+            summaryTokens?: number
+            compactedAt?: number | null
+          }
+        | undefined
+      const fmtInt = (n: number) => n.toLocaleString('en-US')
+      const parts: Array<string> = []
+      if (stats?.messages) parts.push(`${fmtInt(stats.messages)} messages`)
+      if (stats?.sourceTokens) {
+        parts.push(
+          stats.summaryTokens
+            ? `${fmtInt(stats.sourceTokens)} → ${fmtInt(stats.summaryTokens)} tokens`
+            : `${fmtInt(stats.sourceTokens)} tokens`,
+        )
+      }
+      if (stats?.compactedAt) {
+        parts.push(
+          new Date(stats.compactedAt).toLocaleString(undefined, {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+          }),
+        )
+      }
+      const detail = parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
       return (
         <div
           key={getStableMessageId(chatMessage, realIndex)}
@@ -1350,8 +1379,8 @@ function ChatMessageListComponent({
           data-chat-message-id={(chatMessage as any).id}
         >
           <div className="h-px flex-1 border-t border-dashed border-primary-300" />
-          <span className="whitespace-nowrap">
-            Context compacted here — older messages are summarized for the agent
+          <span className="whitespace-nowrap" title="Older messages above were folded into a summary for the agent">
+            Context compacted here{detail}
           </span>
           <div className="h-px flex-1 border-t border-dashed border-primary-300" />
         </div>
