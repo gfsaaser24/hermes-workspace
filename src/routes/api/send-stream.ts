@@ -952,6 +952,15 @@ export const Route = createFileRoute('/api/send-stream')({
                       persistActiveRun((runSessionKey, activeId) =>
                         markRunStatus(runSessionKey, activeId, 'complete'),
                       )
+                      // hermes-jcmm: the browser's live buffer still holds the
+                      // whole turn from the mid-run fullReplace chunks; hand it
+                      // the last segment so the placeholder matches the row.
+                      sendEvent('chunk', {
+                        text: responsesFinalText,
+                        fullReplace: true,
+                        sessionKey: portableSessionKey,
+                        runId,
+                      })
                       sendEvent('done', {
                         state: 'complete',
                         sessionKey: portableSessionKey,
@@ -1084,6 +1093,15 @@ export const Route = createFileRoute('/api/send-stream')({
                   persistActiveRun((runSessionKey, activeId) =>
                     markRunStatus(runSessionKey, activeId, 'complete'),
                   )
+                  // hermes-jcmm: same as above — the client's live buffer must
+                  // end on the last segment, or the finished placeholder never
+                  // matches the transcript row and the answer shows twice.
+                  sendEvent('chunk', {
+                    text: portableFinalText,
+                    fullReplace: true,
+                    sessionKey: portableSessionKey,
+                    runId,
+                  })
                   sendEvent('done', {
                     state: 'complete',
                     sessionKey: portableSessionKey,

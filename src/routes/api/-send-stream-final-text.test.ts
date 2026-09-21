@@ -476,6 +476,12 @@ describe('send-stream ends a turn on its last assistant message', () => {
 
     expect(doneMessageText(events).trim()).toBe('DONE')
     expect(doneMessageText(events)).not.toContain('one')
+    // The browser's live buffer must end on the last segment too, or the
+    // finished placeholder ("one DONE") never matches the "DONE" row.
+    const replaces = events.filter(
+      (e) => e.event === 'chunk' && e.data.fullReplace === true,
+    )
+    expect(String(replaces[replaces.length - 1].data.text).trim()).toBe('DONE')
 
     const run = await settledRun(runId, sessionKey)
     expect(run?.status).toBe('complete')

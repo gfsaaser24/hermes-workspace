@@ -2400,11 +2400,15 @@ function MessageItemComponent({
             toolMessage.toolName.trim()) ||
           parseToolNameFromMessageText(messageText)
         return {
+          // hermes-jcmm: tool-call id first so the section dedupes against
+          // the same call streamed live / embedded in __streamToolCalls
+          // (an attached assistant row carries it in its toolCall block).
           key:
-            (typeof (toolMessage as any).id === 'string' &&
-              (toolMessage as any).id) ||
             (typeof toolMessage.toolCallId === 'string' &&
               toolMessage.toolCallId) ||
+            getToolCallsFromMessage(toolMessage)[0]?.id ||
+            (typeof (toolMessage as any).id === 'string' &&
+              (toolMessage as any).id) ||
             `${toolType}-${index}`,
           type: toolType,
           input: readToolArgs(toolMessage.details),
@@ -2449,7 +2453,7 @@ function MessageItemComponent({
   const inlineToolSections = useMemo<Array<InlineToolSection>>(
     () => [
       ...mergeToolSectionsById(
-        streamToolSections,
+        mergeToolSectionsById(streamToolSections, attachedToolSections),
         toolParts.map((toolPart, index) => {
           const rawOutput = toolPart.output
           let outputText = ''
@@ -2471,7 +2475,6 @@ function MessageItemComponent({
           }
         }),
       ),
-      ...attachedToolSections,
     ],
     [attachedToolSections, streamToolSections, toolParts],
   )
