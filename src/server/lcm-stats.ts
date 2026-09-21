@@ -87,25 +87,45 @@ async function openReadOnly(file: string): Promise<{
 
 const statsCache = new Map<string, CompactionStats | null>()
 
+// The marker row re-prints the whole recent summary on every compaction, so
+// the node number in its text is the FIRST node, not this compaction's. The
+// compaction event is the summary node written right before the marker row
+// (created_at within a few seconds of the row's timestamp); fall back to the
+// node named in the text when no timestamp is known.
 export async function readCompactionStats(
   sessionId: string,
-  node: number,
+  node: number | null,
+  markerAtMs?: number | null,
 ): Promise<CompactionStats | null> {
-  const cacheKey = `${sessionId}:${node}`
+  const markerAt = markerAtMs && markerAtMs > 0 ? markerAtMs / 1000 : null
+  const cacheKey = `${sessionId}:${node ?? '-'}:${markerAt ? Math.round(markerAt) : '-'}`
   if (statsCache.has(cacheKey)) return statsCache.get(cacheKey) ?? null
   let found: CompactionStats | null = null
   for (const file of lcmDbCandidates()) {
     const db = await openReadOnly(file)
     if (!db) continue
     try {
-      const row = db
-        .prepare(
-          'SELECT node_id, session_id, token_count, source_token_count, source_ids, created_at, earliest_at, latest_at FROM summary_nodes WHERE node_id = ? AND session_id = ?',
-        )
-        .get(node, sessionId) as SummaryNodeRow | undefined
+      const columns =
+        'node_id, session_id, token_count, source_token_count, source_ids, created_at, earliest_at, latest_at'
+      let row: SummaryNodeRow | undefined
+      if (markerAt) {
+        row = db
+          .prepare(
+            `SELECT ${columns} FROM summary_nodes WHERE session_id = ? AND created_at <= ? ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(sessionId, markerAt + 30) as SummaryNodeRow | undefined
+        // A node written long before this marker belongs to an earlier
+        // compaction; only accept a close match.
+        if (row && Number(row.created_at) < markerAt - 600) row = undefined
+      }
+      if (!row && node !== null) {
+        row = db
+          .prepare(`SELECT ${columns} FROM summary_nodes WHERE node_id = ? AND session_id = ?`)
+          .get(node, sessionId) as SummaryNodeRow | undefined
+      }
       if (row) {
         found = {
-          node,
+          node: Number(row.node_id) || node || 0,
           messages: countSourceIds(row.source_ids),
           sourceTokens: Number(row.source_token_count) || 0,
           summaryTokens: Number(row.token_count) || 0,

@@ -146,7 +146,8 @@ export const Route = createFileRoute('/api/history')({
               continue
             }
             const node = typeof chat.__compactionNode === 'number' ? chat.__compactionNode : null
-            const stats = node !== null ? await readCompactionStats(sessionKey, node) : null
+            const markerAt = typeof chat.timestamp === 'number' ? chat.timestamp : null
+            const stats = await readCompactionStats(sessionKey, node, markerAt)
             chat.__compaction = {
               node,
               messages: stats?.messages || sinceLastMarker,
