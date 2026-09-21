@@ -23,7 +23,16 @@ export type PersistedRunState = {
   runId: string
   sessionKey: string
   friendlyId: string
-  status: 'accepted' | 'active' | 'handoff' | 'stalled' | 'complete' | 'error'
+  // hermes-jcmm: 'stopped' = an explicit user Stop. Terminal, like
+  // complete/error, so nothing re-attaches to it.
+  status:
+    | 'accepted'
+    | 'active'
+    | 'handoff'
+    | 'stalled'
+    | 'complete'
+    | 'error'
+    | 'stopped'
   createdAt: number
   updatedAt: number
   lastEventAt: number
@@ -218,6 +227,12 @@ export async function markRunStatus(
 // until the 120s client-side failsafe clears it.
 const STALE_RUN_THRESHOLD_MS = 5 * 60 * 1000
 
+const TERMINAL_STATUSES: ReadonlySet<PersistedRunState['status']> = new Set([
+  'complete',
+  'error',
+  'stopped',
+])
+
 async function readRunsInDir(dir: string): Promise<Array<PersistedRunState>> {
   const files = (await readdir(dir)).filter((name) => name.endsWith('.json'))
   if (files.length === 0) return []
@@ -241,7 +256,7 @@ export async function getActiveRunForSession(
     const runs = await readRunsInDir(sessionDir(sessionKey))
     const now = Date.now()
     const candidates = runs
-      .filter((run) => !['complete', 'error'].includes(run.status))
+      .filter((run) => !TERMINAL_STATUSES.has(run.status))
       .filter((run) => now - run.updatedAt < STALE_RUN_THRESHOLD_MS)
       .sort((a, b) => b.updatedAt - a.updatedAt)
     return candidates[0] ?? null
@@ -262,7 +277,7 @@ export async function listAllActiveRuns(): Promise<Array<PersistedRunState>> {
     const runsBySession = await Promise.all(sessionDirs.map(readRunsInDir))
     return runsBySession
       .flat()
-      .filter((run) => !['complete', 'error'].includes(run.status))
+      .filter((run) => !TERMINAL_STATUSES.has(run.status))
       .sort((a, b) => b.updatedAt - a.updatedAt)
   } catch {
     return []

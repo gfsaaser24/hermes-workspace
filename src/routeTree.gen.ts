@@ -176,6 +176,7 @@ import { Route as ApiMcpHubSourcesIdRouteImport } from './routes/api/mcp/hub-sou
 import { Route as ApiMcpNameLogsRouteImport } from './routes/api/mcp/$name.logs'
 import { Route as ApiHermesworldReservationsConfirmRouteImport } from './routes/api/hermesworld/reservations/confirm'
 import { Route as ApiExternalConversationsConversationIdMessagesRouteImport } from './routes/api/external-conversations.$conversationId.messages'
+import { Route as ApiRunsSessionKeyRunIdStreamRouteImport } from './routes/api/runs/$sessionKey.$runId.stream'
 import { Route as ApiRunsSessionKeyRunIdAbandonRouteImport } from './routes/api/runs/$sessionKey.$runId.abandon'
 
 const WorldRoute = WorldRouteImport.update({
@@ -1024,6 +1025,12 @@ const ApiExternalConversationsConversationIdMessagesRoute =
     path: '/messages',
     getParentRoute: () => ApiExternalConversationsConversationIdRoute,
   } as any)
+const ApiRunsSessionKeyRunIdStreamRoute =
+  ApiRunsSessionKeyRunIdStreamRouteImport.update({
+    id: '/api/runs/$sessionKey/$runId/stream',
+    path: '/api/runs/$sessionKey/$runId/stream',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiRunsSessionKeyRunIdAbandonRoute =
   ApiRunsSessionKeyRunIdAbandonRouteImport.update({
     id: '/api/runs/$sessionKey/$runId/abandon',
@@ -1200,6 +1207,7 @@ export interface FileRoutesByFullPath {
   '/api/sessions/$sessionKey/active-run': typeof ApiSessionsSessionKeyActiveRunRoute
   '/api/sessions/$sessionKey/status': typeof ApiSessionsSessionKeyStatusRoute
   '/api/runs/$sessionKey/$runId/abandon': typeof ApiRunsSessionKeyRunIdAbandonRoute
+  '/api/runs/$sessionKey/$runId/stream': typeof ApiRunsSessionKeyRunIdStreamRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -1369,6 +1377,7 @@ export interface FileRoutesByTo {
   '/api/sessions/$sessionKey/active-run': typeof ApiSessionsSessionKeyActiveRunRoute
   '/api/sessions/$sessionKey/status': typeof ApiSessionsSessionKeyStatusRoute
   '/api/runs/$sessionKey/$runId/abandon': typeof ApiRunsSessionKeyRunIdAbandonRoute
+  '/api/runs/$sessionKey/$runId/stream': typeof ApiRunsSessionKeyRunIdStreamRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -1540,6 +1549,7 @@ export interface FileRoutesById {
   '/api/sessions/$sessionKey/active-run': typeof ApiSessionsSessionKeyActiveRunRoute
   '/api/sessions/$sessionKey/status': typeof ApiSessionsSessionKeyStatusRoute
   '/api/runs/$sessionKey/$runId/abandon': typeof ApiRunsSessionKeyRunIdAbandonRoute
+  '/api/runs/$sessionKey/$runId/stream': typeof ApiRunsSessionKeyRunIdStreamRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -1712,6 +1722,7 @@ export interface FileRouteTypes {
     | '/api/sessions/$sessionKey/active-run'
     | '/api/sessions/$sessionKey/status'
     | '/api/runs/$sessionKey/$runId/abandon'
+    | '/api/runs/$sessionKey/$runId/stream'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -1881,6 +1892,7 @@ export interface FileRouteTypes {
     | '/api/sessions/$sessionKey/active-run'
     | '/api/sessions/$sessionKey/status'
     | '/api/runs/$sessionKey/$runId/abandon'
+    | '/api/runs/$sessionKey/$runId/stream'
   id:
     | '__root__'
     | '/'
@@ -2051,6 +2063,7 @@ export interface FileRouteTypes {
     | '/api/sessions/$sessionKey/active-run'
     | '/api/sessions/$sessionKey/status'
     | '/api/runs/$sessionKey/$runId/abandon'
+    | '/api/runs/$sessionKey/$runId/stream'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -2189,6 +2202,7 @@ export interface RootRouteChildren {
   ChatExternalConversationIdRoute: typeof ChatExternalConversationIdRoute
   ChatHarnessRuntimeIdRoute: typeof ChatHarnessRuntimeIdRoute
   ApiRunsSessionKeyRunIdAbandonRoute: typeof ApiRunsSessionKeyRunIdAbandonRoute
+  ApiRunsSessionKeyRunIdStreamRoute: typeof ApiRunsSessionKeyRunIdStreamRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -3362,6 +3376,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiExternalConversationsConversationIdMessagesRouteImport
       parentRoute: typeof ApiExternalConversationsConversationIdRoute
     }
+    '/api/runs/$sessionKey/$runId/stream': {
+      id: '/api/runs/$sessionKey/$runId/stream'
+      path: '/api/runs/$sessionKey/$runId/stream'
+      fullPath: '/api/runs/$sessionKey/$runId/stream'
+      preLoaderRoute: typeof ApiRunsSessionKeyRunIdStreamRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/runs/$sessionKey/$runId/abandon': {
       id: '/api/runs/$sessionKey/$runId/abandon'
       path: '/api/runs/$sessionKey/$runId/abandon'
@@ -3750,6 +3771,7 @@ const rootRouteChildren: RootRouteChildren = {
   ChatExternalConversationIdRoute: ChatExternalConversationIdRoute,
   ChatHarnessRuntimeIdRoute: ChatHarnessRuntimeIdRoute,
   ApiRunsSessionKeyRunIdAbandonRoute: ApiRunsSessionKeyRunIdAbandonRoute,
+  ApiRunsSessionKeyRunIdStreamRoute: ApiRunsSessionKeyRunIdStreamRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

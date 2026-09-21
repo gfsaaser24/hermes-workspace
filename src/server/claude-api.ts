@@ -393,6 +393,30 @@ export async function lockSessionModel(sessionId: string, model: string): Promis
   }
 }
 
+/**
+ * hermes-jcmm: best-effort agent-side stop for an explicit user Stop.
+ * The durable-run API (POST /v1/runs/{id}/stop) only knows runs it admitted,
+ * so this quietly no-ops when the id came from the session chat stream.
+ */
+export async function stopAgentRun(runId: string): Promise<boolean> {
+  const id = runId.trim()
+  if (!id) return false
+  try {
+    const res = await fetch(
+      `${CLAUDE_API}/v1/runs/${encodeURIComponent(id)}/stop`,
+      {
+        method: 'POST',
+        headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: AbortSignal.timeout(5000),
+      },
+    )
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 export async function streamChat(
   sessionId: string,
   body: {

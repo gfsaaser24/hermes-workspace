@@ -507,6 +507,9 @@ export function useChatHistory({
         // system event. Do not hide user-pasted context summaries merely because
         // they quote these phrases somewhere inside the text.
         if (text.startsWith('Pre-compaction memory flush')) return false
+        // hermes-jcmm: hermes-lcm replaces compacted messages with a summary
+        // row carrying role 'user'. Hide it, never treat it as a failure.
+        if (text.startsWith('[CONTEXT COMPACTION')) return false
         if (text.startsWith('Store durable memories now')) return false
         if (text.startsWith('Summarize this naturally for the user'))
           return false

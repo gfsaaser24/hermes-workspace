@@ -13,7 +13,10 @@ export type ResponseWaitSnapshot = {
 export function isTerminalActiveRunStatus(status: unknown): boolean {
   return (
     typeof status === 'string' &&
-    ['complete', 'completed', 'failed', 'cancelled', 'error'].includes(status)
+    // hermes-jcmm: 'stopped' = explicit user Stop, also terminal.
+    ['complete', 'completed', 'failed', 'cancelled', 'error', 'stopped'].includes(
+      status,
+    )
   )
 }
 

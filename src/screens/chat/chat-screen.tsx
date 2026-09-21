@@ -55,6 +55,7 @@ import { snapshotOptimisticUserMessages } from './hooks/optimistic-message-reinj
 import { useSmoothStreamingText } from './hooks/use-smooth-streaming-text'
 import { useStreamingMessage } from './hooks/use-streaming-message'
 import { useActiveRunCheck } from './hooks/use-active-run-check'
+import { requestRunStop, useRunResume } from './hooks/use-run-resume'
 import { useChatMobile } from './hooks/use-chat-mobile'
 import { useChatSessions } from './hooks/use-chat-sessions'
 import { useAutoSessionTitle } from './hooks/use-auto-session-title'
@@ -1308,6 +1309,20 @@ export function ChatScreen({
     handoffTimeoutMs: modelsQuery.data?.streamHandoffTimeoutMs,
   })
 
+  // hermes-jcmm: re-attach to a run that is still executing server-side after
+  // a reload / tab switch / dropped SSE. Replays the tool cards + text so far,
+  // then tails the live run. Only runs when no local send-stream is attached.
+  const { resumedRunId, stopResumedRun } = useRunResume({
+    sessionKey: resolvedSessionKey || '',
+    enabled: !isNewChat && Boolean(resolvedSessionKey),
+    isLocalStreamActive: localIsStreaming || sending,
+    onRunComplete: useCallback(() => {
+      // History may have been compacted mid-run (hermes-lcm). Refetching is
+      // always safe — a shorter message list is a valid result, never an error.
+      refreshHistoryRef.current()
+    }, []),
+  })
+
   // Cancel any in-flight stream when the user navigates between sessions or
   // starts a new chat. Without this, an SSE stream from session A keeps
   // running after the user navigates away — and any chunks it had already
@@ -1779,6 +1794,10 @@ export function ChatScreen({
   const shouldRedirectToNew =
     !isNewChat &&
     !forcedSessionKey &&
+    // hermes-jcmm: never bounce the user out of a session whose agent is
+    // still working — the sessions list can lag a freshly created session.
+    !resumedRunId &&
+    !waitingForResponse &&
     !isRecentSession(activeFriendlyId) &&
     sessionsQuery.isSuccess &&
     sessions.length > 0 &&
@@ -2572,11 +2591,40 @@ export function ChatScreen({
       )
     }
     activeSendRef.current = null
+    // hermes-jcmm: a browser disconnect deliberately KEEPS the agent running
+    // now, so Stop has to say stop out loud — otherwise the run keeps burning
+    // tokens after the user hit the button. Fire-and-forget, before we tear
+    // the local stream down. Navigating away must never reach this path.
+    {
+      const stopSessionKey = resolvedSessionKey || activeCanonicalKey || ''
+      const stopRunId =
+        resumedRunId ??
+        streamingRunId ??
+        useChatStore.getState().waitingSessionMeta[stopSessionKey]?.runId ??
+        null
+      if (stopSessionKey && stopRunId) {
+        void requestRunStop(stopSessionKey, stopRunId).then((stopped) => {
+          if (!stopped) {
+            toast('Could not stop the agent run — it may still be working', {
+              type: 'error',
+            })
+          }
+        })
+      }
+    }
     cancelStreaming()
     setSending(false)
     setPendingGeneration(false)
     setWaitingForResponse(false)
-  }, [cancelStreaming, queryClient])
+  }, [
+    activeCanonicalKey,
+    cancelStreaming,
+    queryClient,
+    resolvedSessionKey,
+    resumedRunId,
+    setWaitingForResponse,
+    streamingRunId,
+  ])
 
   const runPaletteSlashCommand = useCallback(
     (command: string) => {
@@ -2820,6 +2868,23 @@ export function ChatScreen({
 
           {errorNotice && (
             <div className="sticky top-0 z-20 px-4 py-2">{errorNotice}</div>
+          )}
+          {/* hermes-jcmm: replaces the dead spinner after a reload mid-run. */}
+          {resumedRunId && (
+            <div
+              className="mx-4 mb-2 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 py-2 text-sm text-sky-900 dark:border-sky-800/50 dark:bg-sky-900/15 dark:text-sky-100"
+              data-testid="run-resume-notice"
+            >
+              <span className="size-2 animate-pulse rounded-full bg-sky-500" />
+              <span>Reconnected — agent still working</span>
+              <button
+                type="button"
+                className="ml-auto rounded-lg border border-sky-300 px-2 py-0.5 text-xs font-medium hover:bg-sky-100 dark:border-sky-700 dark:hover:bg-sky-900/40"
+                onClick={stopResumedRun}
+              >
+                Stop
+              </button>
+            </div>
           )}
           {pendingApprovals.length > 0 && (
             <div className="mx-4 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-800/50 dark:bg-amber-900/15">

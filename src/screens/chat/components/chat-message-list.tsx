@@ -407,6 +407,9 @@ const NEAR_BOTTOM_THRESHOLD = 200
 
 const HIDDEN_SYSTEM_USER_PREFIXES = [
   'Pre-compaction memory flush',
+  // hermes-jcmm: hermes-lcm rewrites compacted history into a summary row
+  // with role 'user'. It is context, not something the user typed.
+  '[CONTEXT COMPACTION',
   'Read HEARTBEAT.md',
   'HEARTBEAT_OK',
   'Execute your Session Startup sequence',

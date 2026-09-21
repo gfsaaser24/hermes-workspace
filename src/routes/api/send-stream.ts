@@ -16,6 +16,12 @@ import {
   setRunThinking,
   upsertRunToolCall,
 } from '../../server/run-store'
+import {
+  RESUME_PUBLISHED_EVENTS,
+  publishRunEvent,
+  registerRunAbort,
+  unregisterRunAbort,
+} from '../../server/run-stream-bus'
 import { getChatMode } from '../../server/gateway-capabilities'
 import { appendLocalMessage, ensureLocalSession, getLocalMessages, touchLocalSession } from '../../server/local-session-store'
 import { getDiscoveredModels, getLocalProviderDef } from '../../server/local-provider-discovery'
@@ -383,6 +389,11 @@ export const Route = createFileRoute('/api/send-stream')({
         // Create streaming response using the SHARED server connection
         const encoder = new TextEncoder()
         let streamClosed = false
+        // hermes-jcmm: the browser is only a SUBSCRIBER to this run. When it
+        // goes away (reload, tab switch, dropped SSE) we stop writing to the
+        // response but keep consuming the agent stream and keep persisting to
+        // run-store, so /api/runs/{session}/{run}/stream can replay + tail it.
+        let clientDetached = false
         let activeRunId: string | null = null
         let activeRunSessionKey: string | null = null
         let persistedRunReady: Promise<unknown> | null = null
@@ -412,18 +423,22 @@ export const Route = createFileRoute('/api/send-stream')({
           abortController.abort()
         }
 
-        // When the client hits Stop / navigates away / closes the tab, the
-        // request.signal fires abort.  Stop the upstream agent (closeStream)
-        // and clean up run tracking so we don't burn API credits on an orphan.
-        function handleAbort() {
-          if (activeRunId && !streamClosed) {
-            persistActiveRun((runSessionKey, activeId) =>
-              markRunStatus(runSessionKey, activeId, 'handoff'),
-            )
-            unregisterActiveSendRun(activeRunId)
-            activeRunId = null
+        // hermes-jcmm: detach the browser without touching the agent run.
+        // Previously this aborted the upstream Hermes fetch and flipped the
+        // run to 'handoff' — which is exactly why a reload during a long tool
+        // chain left the user with a dead spinner and a half-finished turn.
+        // Timers that only serve the browser are cleared; the SEND_STREAM run
+        // timeout still bounds the run.
+        let detachClient = () => {
+          if (clientDetached || streamClosed) return
+          clientDetached = true
+          if (heartbeatTimer) {
+            clearInterval(heartbeatTimer)
+            heartbeatTimer = null
           }
-          closeStream()
+        }
+        function handleAbort() {
+          detachClient()
         }
         request.signal.addEventListener('abort', () => handleAbort(), { once: true })
 
@@ -462,11 +477,40 @@ export const Route = createFileRoute('/api/send-stream')({
             // without tool calls, making it look hung.
             let lastActivity: string | null = null
             const enqueueRaw = (payload: string) => {
-              if (streamClosed) return
-              controller.enqueue(encoder.encode(payload))
+              if (streamClosed || clientDetached) return
+              try {
+                controller.enqueue(encoder.encode(payload))
+              } catch {
+                // The browser went away between checks — keep the run going.
+                clientDetached = true
+              }
+            }
+            // hermes-jcmm: resumers need the ACCUMULATED assistant text. The
+            // browser gets raw deltas (assistant.delta), so normalise here —
+            // a late subscriber must never receive a lone fragment.
+            let resumeText = ''
+            const publishForResume = (
+              event: string,
+              data: Record<string, unknown>,
+            ) => {
+              if (!activeRunId) return
+              if (!RESUME_PUBLISHED_EVENTS.has(event)) return
+              if (event === 'chunk') {
+                const text = typeof data.text === 'string' ? data.text : ''
+                resumeText =
+                  data.fullReplace === true ? text : `${resumeText}${text}`
+                publishRunEvent(activeRunId, 'chunk', {
+                  ...data,
+                  text: resumeText,
+                  fullReplace: true,
+                })
+                return
+              }
+              publishRunEvent(activeRunId, event, data)
             }
             const sendEvent = (event: string, data: unknown) => {
-              if (streamClosed) return
+              publishForResume(event, (data ?? {}) as Record<string, unknown>)
+              if (streamClosed || clientDetached) return
               lastClientEventAt = Date.now()
               const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
               enqueueRaw(payload)
@@ -489,6 +533,20 @@ export const Route = createFileRoute('/api/send-stream')({
               enqueueRaw(': keepalive\n\n')
             }, 10_000)
 
+            detachClient = () => {
+              if (clientDetached || streamClosed) return
+              clientDetached = true
+              if (heartbeatTimer) {
+                clearInterval(heartbeatTimer)
+                heartbeatTimer = null
+              }
+              try {
+                controller.close()
+              } catch {
+                // already torn down by the disconnect
+              }
+            }
+
             closeStream = () => {
               if (streamClosed) return
               streamClosed = true
@@ -506,6 +564,7 @@ export const Route = createFileRoute('/api/send-stream')({
               }
               if (activeRunId) {
                 unregisterActiveSendRun(activeRunId)
+                unregisterRunAbort(activeRunId)
                 activeRunId = null
               }
               abortController.abort()
@@ -541,10 +600,17 @@ export const Route = createFileRoute('/api/send-stream')({
 
                 activeRunId = runId
                 registerActiveSendRun(runId)
+                // hermes-jcmm: an explicit Stop (POST .../abandon) needs a
+                // handle on the upstream fetch — client disconnect no longer
+                // aborts it. Portable runs have no agent-side run id.
+                registerRunAbort(runId, {
+                  abort: () => abortController.abort(),
+                })
                 persistRunStarted(runId, portableSessionKey, portableFriendlyId)
                 unregisterTimer = setTimeout(() => {
                   if (activeRunId) {
                     unregisterActiveSendRun(activeRunId)
+                    unregisterRunAbort(activeRunId)
                     activeRunId = null
                   }
                 }, SEND_STREAM_RUN_TIMEOUT_MS)
@@ -1057,6 +1123,12 @@ export const Route = createFileRoute('/api/send-stream')({
                     if (runId && !activeRunId) {
                       activeRunId = runId
                       registerActiveSendRun(runId)
+                      // hermes-jcmm: see the portable path — this is the only
+                      // way an explicit Stop can reach the agent fetch.
+                      registerRunAbort(runId, {
+                        abort: () => abortController.abort(),
+                        agentRunId: runId,
+                      })
                       persistRunStarted(
                         runId,
                         sessionKeyFromEvent,
@@ -1065,6 +1137,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       unregisterTimer = setTimeout(() => {
                         if (activeRunId) {
                           unregisterActiveSendRun(activeRunId)
+                          unregisterRunAbort(activeRunId)
                           activeRunId = null
                         }
                       }, SEND_STREAM_RUN_TIMEOUT_MS)
@@ -1544,17 +1617,12 @@ export const Route = createFileRoute('/api/send-stream')({
             }
           },
           cancel() {
-            // User clicked Stop, navigated away, or browser closed the tab.
-            // Mark the stream complete, persist the run as 'handoff' so
-            // session history reflects the interruption, then delegate to
-            // closeStream() for timer/controller cleanup.  Delegate instead
-            // of duplicating cleanup logic to keep the two paths in sync.
-            if (activeRunId && !streamClosed) {
-              persistActiveRun((runSessionKey, activeId) =>
-                markRunStatus(runSessionKey, activeId, 'handoff'),
-              )
-            }
-            closeStream()
+            // hermes-jcmm: the browser reader went away (reload, tab switch,
+            // navigation, proxy hiccup). Detach it only — the agent run keeps
+            // going, keeps persisting to run-store, and keeps publishing to
+            // the run bus so the resume stream can pick it up. Use
+            // /api/runs/{session}/{run}/abandon to actually kill a run.
+            detachClient()
           },
         })
 

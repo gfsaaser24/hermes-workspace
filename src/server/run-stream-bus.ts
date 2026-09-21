@@ -1,0 +1,122 @@
+/**
+ * hermes-jcmm: per-run fan-out of already-translated chat SSE events.
+ *
+ * The existing chat-event-bus deliberately DROPS every event whose runId is
+ * registered in send-run-tracker — that dedup is what stops the browser from
+ * rendering a message twice while /api/send-stream is attached. A browser that
+ * reloaded mid-run needs exactly those dropped events, so resume traffic gets
+ * its own bus with no dedup filter.
+ *
+ * In-memory only. The durable copy lives in run-store (disk); this bus is just
+ * the live tail between "what is already persisted" and "what happens next".
+ */
+
+export type RunStreamEvent = {
+  event: string
+  data: Record<string, unknown>
+}
+
+type RunStreamSubscriber = (event: RunStreamEvent) => void
+
+const BUS_KEY = '__hermes_run_stream_bus__' as const
+
+/**
+ * hermes-jcmm: how an explicit user Stop reaches the upstream agent fetch.
+ * The browser disconnecting no longer aborts anything, so Stop needs a
+ * deliberate handle on the run's AbortController.
+ */
+export type RunAbortHandle = {
+  abort: () => void
+  /** Agent-side run id for POST /v1/runs/{id}/stop, when we know one. */
+  agentRunId?: string
+}
+
+type RunStreamBusState = {
+  subscribers: Map<string, Set<RunStreamSubscriber>>
+  aborts: Map<string, RunAbortHandle>
+}
+
+function getBus(): RunStreamBusState {
+  const host = globalThis as Record<string, unknown>
+  if (!host[BUS_KEY]) {
+    host[BUS_KEY] = {
+      subscribers: new Map<string, Set<RunStreamSubscriber>>(),
+      aborts: new Map<string, RunAbortHandle>(),
+    } satisfies RunStreamBusState
+  }
+  return host[BUS_KEY] as RunStreamBusState
+}
+
+export function registerRunAbort(
+  runId: string,
+  handle: RunAbortHandle,
+): void {
+  if (!runId) return
+  getBus().aborts.set(runId, handle)
+}
+
+export function unregisterRunAbort(runId: string): void {
+  getBus().aborts.delete(runId)
+}
+
+export function getRunAbort(runId: string): RunAbortHandle | null {
+  return getBus().aborts.get(runId) ?? null
+}
+
+/** Events worth mirroring to resumers. Keepalives are re-generated per stream. */
+export const RESUME_PUBLISHED_EVENTS: ReadonlySet<string> = new Set([
+  'started',
+  'chunk',
+  'thinking',
+  'tool',
+  'artifact',
+  'step',
+  'done',
+  'error',
+])
+
+export function publishRunEvent(
+  runId: string,
+  event: string,
+  data: Record<string, unknown>,
+): void {
+  if (!runId) return
+  const subscribers = getBus().subscribers.get(runId)
+  if (!subscribers || subscribers.size === 0) return
+  for (const subscriber of subscribers) {
+    try {
+      subscriber({ event, data })
+    } catch {
+      // A broken subscriber must never take down the run.
+    }
+  }
+}
+
+export function subscribeToRunStream(
+  runId: string,
+  subscriber: RunStreamSubscriber,
+): () => void {
+  const bus = getBus()
+  let subscribers = bus.subscribers.get(runId)
+  if (!subscribers) {
+    subscribers = new Set<RunStreamSubscriber>()
+    bus.subscribers.set(runId, subscribers)
+  }
+  subscribers.add(subscriber)
+  return () => {
+    const current = bus.subscribers.get(runId)
+    if (!current) return
+    current.delete(subscriber)
+    if (current.size === 0) bus.subscribers.delete(runId)
+  }
+}
+
+export function runStreamSubscriberCount(runId: string): number {
+  return getBus().subscribers.get(runId)?.size ?? 0
+}
+
+/** Test helper — drops every subscriber and abort handle. */
+export function clearRunStreamBus(): void {
+  getBus().subscribers.clear()
+  getBus().aborts.clear()
+}
