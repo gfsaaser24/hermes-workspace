@@ -36,7 +36,9 @@ import {
 import { loadWorkspaceCatalog } from './workspace'
 import {
   collectSyntheticLiveToolEvents,
+  createRunMessageWindow,
   createSyntheticLiveToolTracker,
+  selectRunMessages,
 } from './-send-stream-live-tools'
 import type {OpenAICompatContentPart, OpenAICompatMessage} from '../../server/openai-compat-api';
 // Claude agent runs can take 5+ minutes with complex tool chains
@@ -945,30 +947,37 @@ export const Route = createFileRoute('/api/send-stream')({
               // useRealtimeChatHistory from creating duplicate message bubbles.
               const skipPublish = true
 
-              // Mid-run tool polling: vanilla Hermes Agent currently does not
-              // emit tool.* SSE events live (callback signature drift). Until
-              // upstream fixes that, we synthesize live tool events by polling
-              // the agent's session messages every ~1.5s during the run and
-              // emitting any new tool calls as event: tool with phase complete
-              // as soon as their tool_result message lands. The Workspace
-              // chat-store dedupes by tool_call_id so this is safe alongside
-              // any real live events that might arrive.
+              // hermes-jcmm: Hermes Agent v0.21.3 DOES emit tool.* SSE events
+              // live (gateway/platforms/api_server.py `_tool_progress` enqueues
+              // tool.started / tool.completed / tool.failed), so this poller is
+              // only a FALLBACK for older agents. It stops itself the moment a
+              // real tool.* event arrives (see stopLiveToolPoller below) so we
+              // don't re-read the whole transcript every 800ms for nothing.
+              // Until then it synthesizes live tool events by polling the
+              // agent's session messages and emitting new tool calls as
+              // event: tool. The Workspace chat-store dedupes by tool_call_id
+              // so this is safe alongside the real live events.
               const syntheticLiveToolTracker = createSyntheticLiveToolTracker()
               let liveRunActive = true
               const livePollIntervalMs = 800
-              // Snapshot the session message count at run-start so the poller
-              // and the post-run backfill only consider messages persisted by
-              // THIS run. Without this, "the most recent assistant with
-              // tool_calls" can resolve to the previous turn, surfacing stale
-              // tool cards (off-by-one-turn bug).
-              let liveBaselineCount = 0
+              // Snapshot the session transcript at run-start so the poller and
+              // the post-run backfill only consider messages persisted by THIS
+              // run. Without this, "the most recent assistant with tool_calls"
+              // can resolve to the previous turn, surfacing stale tool cards
+              // (off-by-one-turn bug).
+              let liveRunWindow = createRunMessageWindow(null)
               try {
                 const baseline = (await getSessionMessagesFromAgent(
                   sessionKey,
                 )) as unknown as Array<Record<string, unknown>>
-                if (Array.isArray(baseline)) liveBaselineCount = baseline.length
+                liveRunWindow = createRunMessageWindow(baseline)
               } catch {
-                liveBaselineCount = 0
+                liveRunWindow = createRunMessageWindow(null)
+              }
+              // hermes-jcmm: the agent's own tool.* events win; once one lands
+              // the fallback poller is redundant and only adds load.
+              const stopLiveToolPoller = () => {
+                liveRunActive = false
               }
               const livePollerPromise = (async () => {
                 // Initial small delay so the agent has time to ingest the
@@ -987,7 +996,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       continue
                     }
                     // Only inspect messages added on or after this run started.
-                    const msgs = allMsgs.slice(liveBaselineCount)
+                    const msgs = selectRunMessages(liveRunWindow, allMsgs)
                     if (msgs.length === 0) {
                       await new Promise((r) =>
                         setTimeout(r, livePollIntervalMs),
@@ -1192,6 +1201,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           preview,
                         }),
                       )
+                      stopLiveToolPoller()
                       sendEvent('tool', translated)
                       skipPublish || publishChatEvent('tool', translated)
                       lastActivity = `Running: ${toolName.replace(/_/g, ' ')}`
@@ -1260,6 +1270,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           result: translated.result,
                         }),
                       )
+                      stopLiveToolPoller()
                       sendEvent('tool', translated)
                       skipPublish || publishChatEvent('tool', translated)
                       lastActivity = `Completed: ${toolName.replace(/_/g, ' ')}`
@@ -1367,6 +1378,7 @@ export const Route = createFileRoute('/api/send-stream')({
                           result: translated.result,
                         }),
                       )
+                      stopLiveToolPoller()
                       sendEvent('tool', translated)
                       skipPublish || publishChatEvent('tool', translated)
                       return
@@ -1427,15 +1439,9 @@ export const Route = createFileRoute('/api/send-stream')({
                           // follow it so we can pair input/output.
                           // Use the per-run baseline so we never read tool
                           // calls from a previous turn.
-                          const sliceFrom = Math.max(
-                            0,
-                            Math.min(
-                              liveBaselineCount,
-                              Math.max(0, persistedMessages.length - 1),
-                            ),
-                          )
-                          const recent = persistedMessages.slice(
-                            sliceFrom,
+                          const recent = selectRunMessages(
+                            liveRunWindow,
+                            persistedMessages,
                           )
                           let lastAssistantIndex = -1
                           for (let i = recent.length - 1; i >= 0; i--) {

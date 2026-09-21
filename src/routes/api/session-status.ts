@@ -140,7 +140,11 @@ export const Route = createFileRoute('/api/session-status')({
             })
           }
 
-          if (isSyntheticSessionKey(sessionKey)) {
+          // hermes-jcmm: 'main' is only a synthetic alias when the gateway has
+          // no real session with that id. With a real one, fall through to
+          // getSession() below so the model/label come from that session's own
+          // per-session lock instead of readContextUsage()'s fallback.
+          if (isSyntheticSessionKey(sessionKey) && !realMain) {
             const contextUsage = await readContextUsage(sessionKey)
             return json({
               ok: true,

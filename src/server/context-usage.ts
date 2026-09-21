@@ -9,6 +9,7 @@ import { listSessions } from '@/server/claude-api'
 import { getLocalMessages, getLocalSession } from './local-session-store'
 import { getActiveRunForSession } from './run-store'
 import {
+  hasRealMainSession,
   resolveMainChatSessionId,
   shouldBindMainToPortableSession,
 } from '@/server/session-utils'
@@ -229,11 +230,28 @@ async function readConfiguredModelContext(): Promise<ResolvedModelContext | null
   }
 }
 
+// hermes-jcmm: `GET /api/sessions/{id}/runtime` does not exist on Hermes Agent
+// v0.21.3 (it is absent from the api_server route table), so every context
+// poll was spending a request on a guaranteed 404. Latch the endpoint off for
+// the life of the process once several calls in a row 404 with no success in
+// between — a single 404 only means "no such session", but a missing route
+// never answers. Logged once; a gateway upgrade needs a restart anyway.
+const RUNTIME_MISSING_STRIKES = 3
+let runtimeEndpointMissing = false
+let runtimeConsecutive404 = 0
+
+/** Test-only: clear the per-process 404 latch between cases. */
+export function resetRuntimeEndpointProbe(): void {
+  runtimeEndpointMissing = false
+  runtimeConsecutive404 = 0
+}
+
 async function readGatewayRuntimeSnapshot(
   sessionId: string,
 ): Promise<ContextUsageSnapshot | null> {
   const sid = sessionId.trim()
   if (!sid) return null
+  if (runtimeEndpointMissing) return null
   try {
     const res = await fetch(
       `${CLAUDE_API}/api/sessions/${encodeURIComponent(sid)}/runtime`,
@@ -242,6 +260,18 @@ async function readGatewayRuntimeSnapshot(
         signal: AbortSignal.timeout(2500),
       },
     )
+    if (res.status === 404) {
+      runtimeConsecutive404 += 1
+      if (runtimeConsecutive404 >= RUNTIME_MISSING_STRIKES) {
+        runtimeEndpointMissing = true
+        console.warn(
+          '[context-usage] Hermes gateway has no /api/sessions/{id}/runtime endpoint; ' +
+            'falling back to session totals for the rest of this process.',
+        )
+      }
+    } else {
+      runtimeConsecutive404 = 0
+    }
     if (!res.ok) return null
     const data = (await res.json()) as {
       model?: unknown
@@ -286,6 +316,11 @@ async function readGatewayRuntimeSnapshot(
 async function resolveRuntimeSessionId(sessionId: string): Promise<string> {
   const trimmed = sessionId.trim()
   if (trimmed !== 'main') return trimmed
+
+  // hermes-jcmm: when the gateway has a REAL session whose id is literally
+  // 'main', read that session — never the 'most recently titled chat' alias,
+  // which would report another conversation's model and context usage.
+  if (await hasRealMainSession()) return trimmed
 
   const capabilities = getCapabilities()
   if (

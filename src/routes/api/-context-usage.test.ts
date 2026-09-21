@@ -29,11 +29,15 @@ import {
   estimateContextTokensFromMessages,
   estimateContextTokensFromSessionUsage,
   readContextUsage,
+  resetRuntimeEndpointProbe,
 } from '../../server/context-usage'
 
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.clearAllMocks()
+  // The missing-/runtime latch is per-process; clear it so a case that 404s
+  // does not disable the endpoint for later cases.
+  resetRuntimeEndpointProbe()
 })
 
 describe('context usage estimation', () => {
