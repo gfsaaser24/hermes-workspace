@@ -25,9 +25,9 @@ describe('resolveSwarmModelLabel', () => {
   })
 
   it('resolves Claude Sonnet labels', () => {
-    expect(resolveSwarmModelLabel('Sonnet 4.6')).toEqual({
-      provider: 'anthropic-oauth',
-      default: 'claude-sonnet-4-6',
+    expect(resolveSwarmModelLabel('Sonnet 5.5')).toEqual({
+      provider: 'custom:claude-code',
+      default: 'claude-sonnet-5-5',
     })
     expect(resolveSwarmModelLabel('Sonnet 4.5')).toEqual({
       provider: 'anthropic',

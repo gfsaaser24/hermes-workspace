@@ -18,7 +18,7 @@ function formatRelativeTime(ts: number): string {
 export const MODEL_PRESETS = [
   { id: 'auto', label: 'Auto (Gateway Default)', desc: 'Uses your configured default model' },
   { id: 'opus', label: 'Claude Opus 4.6', desc: 'Deep reasoning — Anthropic' },
-  { id: 'sonnet', label: 'Claude Sonnet 4.6', desc: 'Fast & capable — Anthropic' },
+  { id: 'sonnet', label: 'Claude Sonnet 5.5', desc: 'Claude Code shim (Max OAuth)' },
   { id: 'codex', label: 'GPT-5 Codex', desc: 'Code specialist — OpenAI' },
   { id: 'flash', label: 'Gemini 2.5 Flash', desc: 'Quick & cheap — Google' },
   { id: 'minimax', label: 'MiniMax M3', desc: 'Cost efficient — MiniMax' },

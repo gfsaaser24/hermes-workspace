@@ -40,7 +40,7 @@ export function resolveSwarmModelLabel(
     return { provider: 'anthropic-oauth', default: 'claude-opus-4-5' }
   }
   if (/^sonnet\s*4\.6$|^claude\s*sonnet\s*4\.6$/.test(normalized)) {
-    return { provider: 'anthropic-oauth', default: 'claude-sonnet-4-6' }
+    return { provider: 'custom:claude-code', default: 'claude-sonnet-5-5' }
   }
   if (/^sonnet\s*4\.5$|^claude\s*sonnet\s*4\.5$/.test(normalized)) {
     return { provider: 'anthropic', default: 'claude-sonnet-4-5' }

@@ -277,7 +277,7 @@ const SETTINGS: Array<SettingDefinition> = [
       'Ordered fallback models. Use one per line or separate with commas.',
     kind: 'multiline',
     rows: 3,
-    placeholder: 'anthropic-oauth/claude-sonnet-4-6',
+    placeholder: 'claude-code/claude-sonnet-5-5',
     formatter: formatStringList,
     parser: parseStringList,
   },

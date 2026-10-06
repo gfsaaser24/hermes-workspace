@@ -377,7 +377,7 @@ describe('buildDashboardOverview', () => {
         top_models: [
           { id: 'gpt-5.4', tokens: 1_000_000, calls: 200 },
           { id: 'opus-4-7', tokens: 3_500_000, calls: 80 },
-          { id: 'sonnet-4-6', tokens: 250_000, calls: 50 },
+          { id: 'sonnet-5-5', tokens: 250_000, calls: 50 },
           { id: 'gpt-5.5', tokens: 250_000, calls: 30 },
         ],
       },
@@ -388,7 +388,7 @@ describe('buildDashboardOverview', () => {
     expect(overview.analytics?.topModels.map((m) => m.id)).toEqual([
       'opus-4-7',
       'gpt-5.4',
-      'sonnet-4-6',
+      'sonnet-5-5',
       'gpt-5.5',
     ])
   })

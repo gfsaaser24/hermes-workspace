@@ -180,7 +180,7 @@ const PROVIDER_CARDS: Array<{
     id: 'anthropic',
     name: 'Anthropic',
     logo: '/providers/anthropic.png',
-    models: ['claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-3-5'],
+    models: ['claude-sonnet-5-5', 'claude-opus-4-6', 'claude-haiku-3-5'],
     authType: 'api_key',
     envKey: 'ANTHROPIC_API_KEY',
   },

@@ -181,7 +181,7 @@ export function ProviderLogo({ provider, size = 28 }: { provider: string; size?:
 export const PROVIDER_COMMON_MODELS: Record<string, Array<{ value: string; label: string }>> = {
   anthropic: [
     { value: 'anthropic/claude-opus-4-6', label: 'Claude Opus 4.6' },
-    { value: 'anthropic/claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
+    { value: 'claude-code/claude-sonnet-5-5', label: 'Claude Sonnet 5.5' },
     { value: 'anthropic/claude-haiku-3-5', label: 'Claude Haiku 3.5' },
   ],
   openai: [

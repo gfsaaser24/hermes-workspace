@@ -50,7 +50,7 @@ export const TEMPLATE_MODEL_SUGGESTIONS: Record<TeamTemplateId, Array<ModelPrese
 export const MODEL_PRESET_MAP: Record<string, string> = {
   auto: '',
   opus: 'anthropic/claude-opus-4-6',
-  sonnet: 'anthropic/claude-sonnet-4-6',
+  sonnet: 'claude-code/claude-sonnet-5-5',
   codex: 'openai/gpt-5.3-codex',
   flash: 'google/gemini-2.5-flash',
   minimax: 'minimax/MiniMax-M3',

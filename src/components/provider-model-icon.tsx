@@ -10,7 +10,7 @@ import type { CSSProperties } from 'react'
 import { cn } from '@/lib/utils'
 
 type ProviderModelIconProps = {
-  /** Full model string e.g. "anthropic/claude-sonnet-4-6" or just "claude-sonnet-4-6" */
+  /** Full model string e.g. "anthropic/claude-sonnet-5-5" or just "claude-sonnet-5-5" */
   model: string
   size?: number
   className?: string

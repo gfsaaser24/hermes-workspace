@@ -68,7 +68,7 @@ function ModelSelector({
 
   const selected = (() => {
     if (!value) return null
-    // If value includes provider prefix (e.g. 'anthropic/claude-sonnet-4-6'),
+    // If value includes provider prefix (e.g. 'anthropic/claude-sonnet-5-5'),
     // match provider+id together to avoid OpenRouter stealing the match
     const slashIndex = value.indexOf('/')
     if (slashIndex > 0) {
