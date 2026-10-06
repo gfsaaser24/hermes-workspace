@@ -1,5 +1,13 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { json } from '@tanstack/react-start'
+import { json as baseJson } from '@tanstack/react-start'
+import { pinModelInStatusBody } from '../../server/model-pin'
+
+// Every status response goes through the deployment model pin (no-op when unset).
+const json: typeof baseJson = ((data: unknown, init?: unknown) =>
+  (baseJson as (d: unknown, i?: unknown) => Response)(
+    pinModelInStatusBody(data),
+    init,
+  )) as typeof baseJson
 import {
   ensureGatewayProbed,
   getConfig,

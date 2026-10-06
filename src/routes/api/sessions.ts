@@ -1,3 +1,4 @@
+import { getPinnedModel } from '../../server/model-pin'
 import { randomUUID } from 'node:crypto'
 import { createFileRoute } from '@tanstack/react-router'
 import { json } from '@tanstack/react-start'
@@ -106,7 +107,8 @@ export const Route = createFileRoute('/api/sessions')({
           const friendlyId = requestedFriendlyId || randomUUID()
 
           const requestedModel =
-            typeof body.model === 'string' ? body.model.trim() : ''
+            getPinnedModel() ||
+            (typeof body.model === 'string' ? body.model.trim() : '')
           const model = requestedModel || undefined
 
           if (capabilities.dashboard.available && !capabilities.enhancedChat) {

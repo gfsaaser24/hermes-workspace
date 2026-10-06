@@ -10,6 +10,7 @@ import {
   getGatewayCapabilities,
 } from '../../server/claude-api'
 import { BEARER_TOKEN, CLAUDE_API } from '../../server/gateway-capabilities'
+import { getPinnedModel } from '../../server/model-pin'
 import {
   ensureDiscovery,
   ensureProviderInConfig,
@@ -411,6 +412,25 @@ export const Route = createFileRoute('/api/models')({
       GET: async ({ request }) => {
         if (!isAuthenticated(request)) {
           return json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+        }
+        // Deployment model pin: the picker offers exactly one model.
+        const pinnedModel = getPinnedModel()
+        if (pinnedModel) {
+          const pinnedEntry = {
+            id: pinnedModel,
+            name: pinnedModel,
+            provider: pinnedModel.includes('/') ? pinnedModel.split('/')[0] : 'unknown',
+          }
+          return json({
+            ok: true,
+            object: 'list',
+            data: [pinnedEntry],
+            models: [pinnedEntry],
+            configuredProviders: [pinnedEntry.provider],
+            pinnedModel,
+            source: 'pin',
+            ...readStreamTimeouts(),
+          })
         }
         await ensureGatewayProbed()
 

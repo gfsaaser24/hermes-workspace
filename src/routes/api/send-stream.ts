@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { buildResolvedSessionHeaders } from '../../lib/send-stream-session-headers'
+import { getPinnedModel } from '../../server/model-pin'
 import { buildWorkspaceScopedTextMessage } from '../../lib/workspace-message-scope'
 import { resolveSessionKey } from '../../server/session-utils'
 import { isAuthenticated } from '../../server/auth-middleware'
@@ -301,6 +302,8 @@ export const Route = createFileRoute('/api/send-stream')({
         } catch {
           // Fall through — body stays empty, will hit 'message required' below
         }
+        // Deployment model pin: a stale per-chat pick never reaches the agent.
+        if (getPinnedModel()) body.model = getPinnedModel()
 
         const rawSessionKey =
           typeof body.sessionKey === 'string' ? body.sessionKey.trim() : ''

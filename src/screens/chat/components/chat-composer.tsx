@@ -1107,9 +1107,32 @@ function ChatComposerComponent({
   // Drives both the composer label and the model passed to startStreaming.
   // Replaces an earlier flow that PATCHed ~/.hermes/config.yaml — that path
   // 404s and would clobber the global default for every channel anyway.
-  const persistedSessionModel = useSessionModelStore((s) =>
+  const rawPersistedSessionModel = useSessionModelStore((s) =>
     s.getModel(sessionKey),
   )
+  // Only honor a stored per-chat pick that the server still offers. A stale
+  // pick (e.g. a model removed from the catalog) is ignored and purged so it
+  // can neither show in the picker nor be sent with the next message.
+  const offeredModelIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const entry of modelsQuery.data?.models ?? []) {
+      const id =
+        typeof entry === 'string' ? entry : entry.id || entry.name || ''
+      if (id) ids.add(id)
+    }
+    return ids
+  }, [modelsQuery.data])
+  const persistedSessionModel =
+    rawPersistedSessionModel && offeredModelIds.has(rawPersistedSessionModel)
+      ? rawPersistedSessionModel
+      : undefined
+  useEffect(() => {
+    if (!modelsQuery.isSuccess || offeredModelIds.size === 0) return
+    const store = useSessionModelStore.getState()
+    for (const [key, model] of Object.entries(store.models)) {
+      if (!offeredModelIds.has(model)) store.clearModel(key)
+    }
+  }, [modelsQuery.isSuccess, offeredModelIds])
   const setPersistedSessionModel = useSessionModelStore((s) => s.setModel)
 
   // Model switching is now per-session via the persistent store above.
